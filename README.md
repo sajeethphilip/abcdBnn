@@ -1,3 +1,131 @@
+
+# BDBNN Pipeline User Manual
+
+## Overview
+The BDBNN Pipeline is an integrated system that combines CNN feature extraction with Bayesian probabilistic classification. It consists of three main components:
+
+1. **CDBNN (Convolutional Deep Neural Network Interface)**
+   - Handles image feature extraction
+   - Processes both built-in torchvision datasets and custom image datasets
+   - Creates standardized features and configurations
+
+2. **ADBNN (Adaptive Difference Boosting Neural Network)**
+   - Performs Bayesian probabilistic classification
+   - Uses adaptive learning to improve classification accuracy
+   - Handles both histogram and Gaussian models
+
+3. **BDBNN (Bridge Module)**
+   - Integrates CDBNN and ADBNN
+   - Provides visualization and analysis tools
+   - Manages configuration and file organization
+
+## Directory Structure
+```
+data/
+├── dataset_name/              # Dataset-specific directory
+│   ├── dataset_name.csv      # Extracted features
+│   ├── dataset_name_predictions.csv
+│   └── visualizations/       # Visualization outputs
+├── dataset_name.conf         # CNN configuration
+└── adaptive_dbnn.conf        # DBNN configuration
+```
+
+## Usage Instructions
+
+1. **Dataset Preparation**
+   - For custom datasets:
+     - Place images in `data/dataset_name/`
+     - Organize in train/test subdirectories
+     - Each class should have its own subdirectory
+   - For torchvision datasets:
+     - Just specify the dataset name (e.g., MNIST)
+
+2. **Running the Pipeline**
+   ```bash
+   python bdbnn.py
+   ```
+   - Enter dataset type (torchvision/custom)
+   - Provide dataset path or name
+   - The pipeline will automatically:
+     - Extract features using CDBNN
+     - Allow configuration editing
+     - Run classification using ADBNN
+     - Generate visualizations
+
+3. **Configuration Editing**
+   - CNN configuration: Controls feature extraction parameters
+   - DBNN configuration: Controls classification parameters
+   - Both can be edited during pipeline execution
+
+4. **Output Files**
+   - Features CSV: Extracted image features
+   - Predictions CSV: Classification results
+   - Visualization files: Interactive plots and analyses
+   - Results text file: Performance metrics
+
+## Key Features
+
+1. **Feature Extraction (CDBNN)**
+   - Handles multiple image formats
+   - Automatic data augmentation
+   - GPU acceleration when available
+   - Configurable CNN architecture
+
+2. **Classification (ADBNN)**
+   - Adaptive learning for improved accuracy
+   - Two modeling options:
+     - Histogram model for discrete data
+     - Gaussian model for continuous data
+   - Automatic parameter tuning
+
+3. **Visualization (BDBNN)**
+   - t-SNE plots for feature visualization
+   - Confusion matrices
+   - Training progress plots
+   - Interactive HTML outputs
+
+## Common Issues and Solutions
+
+1. **Memory Issues**
+   - Reduce batch size in CNN configuration
+   - Use data subsampling for large datasets
+
+2. **Performance Issues**
+   - Enable GPU usage in configuration
+   - Adjust feature dimensions
+
+3. **Configuration Issues**
+   - Check file permissions
+   - Verify JSON syntax in config files
+
+## Dependencies
+- PyTorch
+- NumPy
+- Pandas
+- Plotly
+- scikit-learn
+- matplotlib
+- seaborn
+
+## Best Practices
+
+1. **Dataset Organization**
+   - Use consistent naming conventions
+   - Maintain clean class separation
+   - Ensure balanced class distribution
+
+2. **Configuration Management**
+   - Back up working configurations
+   - Document configuration changes
+   - Use version control for configs
+
+3. **Resource Management**
+   - Monitor GPU memory usage
+   - Use appropriate batch sizes
+   - Clean up temporary files
+
+
+
 # CDBNN
 # CNN Deep Convolution  Network Interface (CDBNN) User Manual
 
