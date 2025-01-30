@@ -208,32 +208,15 @@ class DatasetConfig:
         return config
 
 
-
-    @staticmethod
-    def format_config_file(dataset_name: str) -> bool:
-        """Format and validate configuration file"""
-        config_path = f"{dataset_name}.conf"
-        try:
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config_text = f.read()
-
-            # Remove comments and format JSON
-            clean_config = remove_comments(config_text)
-            config = json.loads(clean_config)
-
-            # Write formatted configuration
-            with open(config_path, 'w', encoding='utf-8') as f:
-                json.dump(config, f, indent=4)
-
-            return True
-        except Exception as e:
-            print(f"Error formatting configuration file: {str(e)}")
-            return False
-
     @staticmethod
     def load_config(dataset_name: str) -> Dict:
-        """Enhanced configuration loading with URL handling"""
-        config_path = os.path.join('data', f"{dataset_name}.conf")
+        """Enhanced configuration loading with URL handling and comment removal"""
+        config_path = f"{dataset_name}.conf"
+
+        # If the config isn't in current directory, check data directory
+        if not os.path.exists(config_path):
+            config_path = os.path.join('data', f"{dataset_name}.conf")
+
         try:
             # Check if configuration file exists
             if not os.path.exists(config_path):
@@ -246,9 +229,14 @@ class DatasetConfig:
                 config_text = f.read()
 
             def remove_comments(json_str):
+                """Remove both inline and multiline comments"""
+                # Handle multi-line comments
                 lines = []
                 in_multiline_comment = False
                 for line in json_str.split('\n'):
+                    if '_comment' in line:
+                        continue
+
                     # Handle multi-line comments
                     if '/*' in line and '*/' in line:
                         line = line[:line.find('/*')] + line[line.find('*/') + 2:]
@@ -267,12 +255,13 @@ class DatasetConfig:
 
                     # Only add non-empty lines
                     stripped = line.strip()
-                    if stripped:
+                    if stripped and not stripped.startswith('_comment'):
                         lines.append(stripped)
+
                 return '\n'.join(lines)
 
+            # Clean configuration text and parse JSON
             clean_config = remove_comments(config_text)
-
             try:
                 config = json.loads(clean_config)
             except json.JSONDecodeError as e:
@@ -280,18 +269,30 @@ class DatasetConfig:
                 print("Creating default configuration instead")
                 return DatasetConfig.create_default_config(dataset_name)
 
-            # Validate and update configuration with defaults
+            # Validate configuration
             validated_config = DatasetConfig.DEFAULT_CONFIG.copy()
             validated_config.update(config)
 
-            # Update file path to use the correct directory structure
-            # This is the key change - constructing the file path correctly
-            file_path = os.path.join('data', dataset_name, f"{dataset_name}.csv")
-            validated_config['file_path'] = file_path
+            # Handle file path
+            if validated_config.get('file_path'):
+                # If path is relative to data directory, update it
+                if not os.path.exists(validated_config['file_path']):
+                    alt_path = os.path.join('data', dataset_name, f"{dataset_name}.csv")
+                    if os.path.exists(alt_path):
+                        validated_config['file_path'] = alt_path
+                        print(f"Using data file: {alt_path}")
 
-            if DatasetConfig.is_url(validated_config['file_path']):
+            # If still no file path, try default location
+            if not validated_config.get('file_path'):
+                default_path = os.path.join('data', dataset_name, f"{dataset_name}.csv")
+                if os.path.exists(default_path):
+                    validated_config['file_path'] = default_path
+                    print(f"Using default data file: {default_path}")
+
+            # If URL, handle download
+            if DatasetConfig.is_url(validated_config.get('file_path', '')):
                 url = validated_config['file_path']
-                local_path = file_path  # Use the constructed file path
+                local_path = os.path.join('data', dataset_name, f"{dataset_name}.csv")
 
                 if not os.path.exists(local_path):
                     print(f"Downloading dataset from {url}")
@@ -302,21 +303,25 @@ class DatasetConfig:
 
                 validated_config['file_path'] = local_path
 
-            # Verify the data file exists
-            if not os.path.exists(validated_config['file_path']):
-                print(f"Warning: Data file {validated_config['file_path']} not found")
-                if not DatasetConfig.is_url(validated_config['file_path']):
-                    print(f"Neither local file nor URL found for {dataset_name}")
-                    if os.path.exists(os.path.join('data', dataset_name, f"{dataset_name}.csv")):
-                        # Try alternate path
-                        validated_config['file_path'] = os.path.join('data', dataset_name, f"{dataset_name}.csv")
-                    else:
-                        return None
+            # Verify data file exists
+            if not validated_config.get('file_path') or not os.path.exists(validated_config['file_path']):
+                print(f"Warning: Data file not found")
+                return None
+
+            # If no column names provided, try to infer from CSV header
+            if not validated_config.get('column_names'):
+                try:
+                    df = pd.read_csv(validated_config['file_path'], nrows=0)
+                    validated_config['column_names'] = df.columns.tolist()
+                    print(f"Inferred column names from CSV: {validated_config['column_names']}")
+                except Exception as e:
+                    print(f"Warning: Could not infer column names: {str(e)}")
+                    return None
 
             return validated_config
 
         except Exception as e:
-            print(f"Error handling configuration for {dataset_name}: {str(e)}")
+            print(f"Error loading configuration for {dataset_name}: {str(e)}")
             traceback.print_exc()
             return None
 
@@ -1178,8 +1183,27 @@ class DBNN(GPUDBNN):
             Dictionary containing processing results
         """
         # Load and validate configuration
-        with open(config_path, 'r') as f:
-            self.data_config = json.load(f)
+        try:
+            with open(config_path, 'r') as f:
+                config_text = f.read()
+
+            # Remove comments starting with _comment
+            config_lines = [line for line in config_text.split('\n') if not '"_comment"' in line]
+            clean_config = '\n'.join(config_lines)
+
+            self.data_config = json.loads(clean_config)
+        except Exception as e:
+            raise ValueError(f"Error reading configuration file: {str(e)}")
+
+        # Ensure file_path is set
+        if not self.data_config.get('file_path'):
+            dataset_name = os.path.splitext(os.path.basename(config_path))[0]
+            default_path = os.path.join('data', dataset_name, f"{dataset_name}.csv")
+            if os.path.exists(default_path):
+                self.data_config['file_path'] = default_path
+                print(f"Using default data file: {default_path}")
+            else:
+                raise ValueError(f"No data file found for {dataset_name}")
 
         # Convert dictionary config to DBNNConfig object
         config_params = {
@@ -1206,13 +1230,11 @@ class DBNN(GPUDBNN):
         # Add row tracking
         self.data['original_index'] = range(len(self.data))
 
-        # Identify excluded features
-        excluded_features = [col.lstrip('#') for col in self.data_config['column_names']
-                           if col.startswith('#')]
-        active_features = [col for col in self.data_config['column_names']
-                         if not col.startswith('#') and col != self.data_config['target_column']]
-
         # Extract features and target
+        if 'target_column' not in self.data_config:
+            self.data_config['target_column'] = 'target'  # Set default target column
+            print(f"Using default target column: 'target'")
+
         X = self.data.drop(columns=[self.data_config['target_column']])
         y = self.data[self.data_config['target_column']]
 
@@ -1240,53 +1262,101 @@ class DBNN(GPUDBNN):
         # Save training log
         self.training_log.to_csv(log_file, index=False)
 
+        # Count number of features actually used (excluding high cardinality and excluded features)
+        n_features = len(X.columns)
+        n_excluded = len(getattr(self, 'high_cardinality_columns', []))
+
         return {
             'results_path': results_path,
             'log_path': log_file,
             'n_samples': len(self.data),
-            'n_features': len(active_features),
-            'n_excluded': len(excluded_features),
+            'n_features': n_features,
+            'n_excluded': n_excluded,
             'training_results': results
         }
 
     def _generate_detailed_predictions(self, X: pd.DataFrame) -> pd.DataFrame:
         """Generate detailed predictions with confidence metrics"""
-        # Get probabilities using existing GPUDBNN methods
-        probabilities = self._compute_batch_posterior(self.X_tensor)[0].cpu().numpy()
+        # Get preprocessed features for probability computation
+        X_processed = self._preprocess_data(X, is_training=False)
+        X_tensor = torch.FloatTensor(X_processed).to(self.device)
 
         # Create results DataFrame
         results_df = self.data.copy()
-        n_classes = len(self.label_encoder.classes_)
-        confidence_threshold = 1.5 / n_classes
 
-        # Add class probabilities
-        for i, class_name in enumerate(self.label_encoder.classes_):
+        # Compute probabilities in batches
+        batch_size = 32
+        all_probabilities = []
+
+        for i in range(0, len(X_tensor), batch_size):
+            batch_end = min(i + batch_size, len(X_tensor))
+            batch_X = X_tensor[i:batch_end]
+
+            try:
+                if self.model_type == "Histogram":
+                    batch_probs, _ = self._compute_batch_posterior(batch_X)
+                elif self.model_type == "Gaussian":
+                    batch_probs, _ = self._compute_batch_posterior_std(batch_X)
+                else:
+                    raise ValueError(f"{self.model_type} is invalid")
+
+                all_probabilities.append(batch_probs.cpu().numpy())
+
+            except Exception as e:
+                print(f"Error computing probabilities for batch {i}: {str(e)}")
+                return None
+
+        if all_probabilities:
+            probabilities = np.vstack(all_probabilities)
+        else:
+            print("No probabilities were computed successfully")
+            return None
+
+        # Get actual classes used in training
+        unique_classes = np.unique(self.label_encoder.transform(self.data[self.target_column]))
+        n_classes = len(unique_classes)
+
+        # Verify probability array shape
+        if probabilities.shape[1] != n_classes:
+            print(f"Warning: Probability array shape ({probabilities.shape}) doesn't match number of classes ({n_classes})")
+            # Adjust probabilities array if necessary
+            if probabilities.shape[1] > n_classes:
+                probabilities = probabilities[:, :n_classes]
+            else:
+                # Pad with zeros if needed
+                pad_width = ((0, 0), (0, n_classes - probabilities.shape[1]))
+                probabilities = np.pad(probabilities, pad_width, mode='constant')
+
+        # Get predictions
+        predictions = np.argmax(probabilities, axis=1)
+
+        # Convert numeric predictions to original class labels
+        results_df['predicted_class'] = self.label_encoder.inverse_transform(predictions)
+
+        # Add probability columns for actual classes used in training
+        for i, class_idx in enumerate(unique_classes):
+            class_name = self.label_encoder.inverse_transform([class_idx])[0]
             results_df[f'prob_{class_name}'] = probabilities[:, i]
 
-        # Get top two predictions
-        top_2_indices = np.argsort(probabilities, axis=1)[:, -2:]
-        results_df['predicted_class'] = self.label_encoder.classes_[top_2_indices[:, 1]]
-        results_df['predicted_prob'] = np.take_along_axis(probabilities, top_2_indices[:, 1:2], axis=1).flatten()
-        results_df['runner_up_class'] = self.label_encoder.classes_[top_2_indices[:, 0]]
-        results_df['runner_up_prob'] = np.take_along_axis(probabilities, top_2_indices[:, 0:1], axis=1).flatten()
+        # Add confidence metrics
+        results_df['max_probability'] = probabilities.max(axis=1)
 
-        # Add verdict/confidence
         if self.target_column in results_df:
-            # For known targets
-            prob_diff = results_df['predicted_prob'] - results_df['runner_up_prob']
-            correct_prediction = results_df['predicted_class'] == results_df[self.target_column]
-            results_df['verdict'] = np.where(
-                (prob_diff > confidence_threshold) & correct_prediction,
-                'Passed',
-                'Failed'
-            )
-        else:
-            # For predictions only
-            prob_diff = results_df['predicted_prob'] - results_df['runner_up_prob']
-            results_df['verdict'] = np.where(
-                prob_diff > confidence_threshold,
-                'Confident',
-                'Not Sure'
+            # Calculate confidence threshold based on number of classes
+            confidence_threshold = 1.5 / n_classes
+
+            # Get true class probabilities
+            true_indices = self.label_encoder.transform(results_df[self.target_column])
+            true_probs = probabilities[np.arange(len(true_indices)), true_indices]
+
+            # Add confidence metrics
+            correct_prediction = (predictions == true_indices)
+            prob_diff = results_df['max_probability'] - true_probs
+
+            results_df['confidence_verdict'] = np.where(
+                (prob_diff < confidence_threshold) & correct_prediction,
+                'High Confidence',
+                'Low Confidence'
             )
 
         return results_df
@@ -2196,7 +2266,7 @@ class DBNN(GPUDBNN):
         return categorical_columns
 
     def _preprocess_data(self, X: pd.DataFrame, is_training: bool = True) -> torch.Tensor:
-        """Preprocess data with improved error handling and debugging"""
+        """Preprocess data with improved error handling and column consistency"""
         print(f"\n[DEBUG] ====== Starting preprocessing ======")
         DEBUG.log(f" Input shape: {X.shape}")
         DEBUG.log(f" Input columns: {X.columns.tolist()}")
@@ -2205,22 +2275,23 @@ class DBNN(GPUDBNN):
         # Make a copy to avoid modifying original data
         X = X.copy()
 
-        # Calculate cardinality threshold
-        cardinality_threshold = self._calculate_cardinality_threshold()
-        DEBUG.log(f" Cardinality threshold: {cardinality_threshold}")
-
         if is_training:
             DEBUG.log(" Training mode preprocessing")
             self.original_columns = X.columns.tolist()
+
+            # Calculate cardinality threshold
+            cardinality_threshold = self._calculate_cardinality_threshold()
+            DEBUG.log(f" Cardinality threshold: {cardinality_threshold}")
 
             # Remove high cardinality columns
             X = self._remove_high_cardinality_columns(X, cardinality_threshold)
             DEBUG.log(f" Shape after cardinality filtering: {X.shape}")
 
+            # Store the features we'll actually use
             self.feature_columns = X.columns.tolist()
             DEBUG.log(f" Selected feature columns: {self.feature_columns}")
 
-            # Store high cardinality columns
+            # Store high cardinality columns for future reference
             self.high_cardinality_columns = list(set(self.original_columns) - set(self.feature_columns))
             if self.high_cardinality_columns:
                 DEBUG.log(f" Removed high cardinality columns: {self.high_cardinality_columns}")
@@ -2229,14 +2300,23 @@ class DBNN(GPUDBNN):
             if not hasattr(self, 'feature_columns'):
                 raise ValueError("Model not trained - feature columns not found")
 
+            # For prediction, only try to use columns that were used during training
+            available_cols = set(X.columns)
+            needed_cols = set(self.feature_columns)
+
+            # Check for missing columns
+            missing_cols = needed_cols - available_cols
+            if missing_cols:
+                # Create missing columns with default values
+                for col in missing_cols:
+                    X[col] = 0
+                    DEBUG.log(f" Created missing column {col} with default value 0")
+
+            # Only keep the columns we used during training
+            X = X[self.feature_columns]
+
             if hasattr(self, 'high_cardinality_columns'):
                 X = X.drop(columns=self.high_cardinality_columns, errors='ignore')
-
-            missing_cols = set(self.feature_columns) - set(X.columns)
-            if missing_cols:
-                raise ValueError(f"Missing required columns: {missing_cols}")
-
-            X = X[self.feature_columns]
 
         # Handle categorical features
         DEBUG.log(" Starting categorical encoding")
@@ -2264,6 +2344,8 @@ class DBNN(GPUDBNN):
                 X_scaled = self.scaler.fit_transform(X_numpy)
             else:
                 X_scaled = self.scaler.transform(X_numpy)
+
+            DEBUG.log(f" Scaling successful")
         except Exception as e:
             DEBUG.log(f" Standard scaling failed: {str(e)}. Using manual scaling")
             if X_numpy.size == 0:
@@ -2955,15 +3037,33 @@ class DBNN(GPUDBNN):
 
     def print_colored_confusion_matrix(self, y_true, y_pred, class_labels=None):
         """Print a color-coded confusion matrix with class-wise accuracy."""
+
+        # Get unique classes from both true and predicted labels
+        unique_true = np.unique(y_true)
+        unique_pred = np.unique(y_pred)
+
+        # Use provided class labels or get from label encoder
         if class_labels is None:
             class_labels = self.label_encoder.classes_
 
-        # Compute confusion matrix
-        cm = confusion_matrix(y_true, y_pred)
+        # Ensure all classes are represented in confusion matrix
+        all_classes = np.unique(np.concatenate([unique_true, unique_pred, class_labels]))
+        n_classes = len(all_classes)
+
+        # Create class index mapping
+        class_to_idx = {cls: idx for idx, cls in enumerate(all_classes)}
+
+        # Initialize confusion matrix with zeros
+        cm = np.zeros((n_classes, n_classes), dtype=int)
+
+        # Fill confusion matrix
+        for t, p in zip(y_true, y_pred):
+            if t in class_to_idx and p in class_to_idx:
+                cm[class_to_idx[t], class_to_idx[p]] += 1
 
         # Calculate class-wise accuracy
         class_accuracy = {}
-        for i in range(len(class_labels)):
+        for i in range(n_classes):
             if cm[i].sum() > 0:  # Avoid division by zero
                 class_accuracy[i] = cm[i, i] / cm[i].sum()
             else:
@@ -2974,18 +3074,18 @@ class DBNN(GPUDBNN):
 
         # Print class labels header
         print(f"{'Actual/Predicted':<15}", end='')
-        for label in class_labels:
+        for label in all_classes:
             print(f"{str(label):<8}", end='')
         print("Accuracy")
-        print("-" * (15 + 8 * len(class_labels) + 10))
+        print("-" * (15 + 8 * n_classes + 10))
 
         # Print matrix with colors
-        for i in range(len(class_labels)):
+        for i in range(n_classes):
             # Print actual class label
-            print(f"{Colors.BOLD}{str(class_labels[i]):<15}{Colors.ENDC}", end='')
+            print(f"{Colors.BOLD}{str(all_classes[i]):<15}{Colors.ENDC}", end='')
 
             # Print confusion matrix row
-            for j in range(len(class_labels)):
+            for j in range(n_classes):
                 if i == j:
                     # Correct predictions in green
                     color = Colors.GREEN
@@ -3007,11 +3107,35 @@ class DBNN(GPUDBNN):
         # Print overall accuracy
         total_correct = np.diag(cm).sum()
         total_samples = cm.sum()
-        overall_acc = total_correct / total_samples
-        print("-" * (15 + 8 * len(class_labels) + 10))
-        color = Colors.GREEN if overall_acc >= 0.9 else Colors.YELLOW if overall_acc >= 0.7 else Colors.RED
-        print(f"{Colors.BOLD}Overall Accuracy: {color}{overall_acc:.2%}{Colors.ENDC}")
+        if total_samples > 0:
+            overall_acc = total_correct / total_samples
+            print("-" * (15 + 8 * n_classes + 10))
+            color = Colors.GREEN if overall_acc >= 0.9 else Colors.YELLOW if overall_acc >= 0.7 else Colors.RED
+            print(f"{Colors.BOLD}Overall Accuracy: {color}{overall_acc:.2%}{Colors.ENDC}")
 
+        # Save confusion matrix to file
+        try:
+            plt.figure(figsize=(10, 8))
+            sns.heatmap(
+                cm,
+                annot=True,
+                fmt='d',
+                cmap='Blues',
+                xticklabels=all_classes,
+                yticklabels=all_classes
+            )
+            plt.title('Confusion Matrix')
+            plt.ylabel('True Label')
+            plt.xlabel('Predicted Label')
+
+            # Save with dataset name
+            if hasattr(self, 'dataset_name'):
+                plt.savefig(f'confusion_matrix_{self.dataset_name}.png')
+            else:
+                plt.savefig('confusion_matrix.png')
+            plt.close()
+        except Exception as e:
+            print(f"Warning: Could not save confusion matrix plot: {str(e)}")
     def train(self, X_train: torch.Tensor, y_train: torch.Tensor, X_test: torch.Tensor, y_test: torch.Tensor, batch_size: int = 32):
         """
         Training loop with proper error tracking and GPU data transfer handling.
@@ -3323,202 +3447,6 @@ class DBNN(GPUDBNN):
 
         print(f"\nDetailed analysis saved to {analysis_file}")
 
-    def save_predictions(self, X: pd.DataFrame, predictions: torch.Tensor, output_file: str, true_labels: pd.Series = None):
-        """Save predictions with proper index handling"""
-        # Convert predictions to numpy
-        predictions = predictions.cpu().numpy() if torch.is_tensor(predictions) else predictions
-
-        # Create result DataFrame with proper indexing
-        result_df = X.copy()
-        result_df['predicted_class'] = self.label_encoder.inverse_transform(predictions)
-
-        if true_labels is not None:
-            result_df['true_class'] = true_labels.values if isinstance(true_labels, pd.Series) else true_labels
-
-        # Get preprocessed features for probability computation
-        X_processed = self._preprocess_data(X, is_training=False)
-        X_tensor = torch.FloatTensor(X_processed).to(self.device)
-
-        # Compute probabilities in batches
-        batch_size = 32
-        all_probabilities = []
-
-        for i in range(0, len(X_tensor), batch_size):
-            batch_end = min(i + batch_size, len(X_tensor))
-            batch_X = X_tensor[i:batch_end]
-
-            try:
-                if self.model_type == "Histogram":
-                    batch_probs, _ = self._compute_batch_posterior(batch_X)
-                elif self.model_type == "Gaussian":
-                    batch_probs, _ = self._compute_batch_posterior_std(batch_X)
-                else:
-                    raise ValueError(f"{self.model_type} is invalid")
-
-                all_probabilities.append(batch_probs.cpu().numpy())
-
-            except Exception as e:
-                print(f"Error computing probabilities for batch {i}: {str(e)}")
-                return None
-
-        all_probabilities = np.vstack(all_probabilities) if all_probabilities else None
-
-        if all_probabilities is not None:
-            # Add probability columns
-            for i, class_name in enumerate(self.label_encoder.classes_):
-                result_df[f'prob_{class_name}'] = all_probabilities[:, i]
-            result_df['max_probability'] = all_probabilities.max(axis=1)
-
-        # Save predictions and verify if true labels exist
-        if true_labels is not None:
-            self.verify_classifications(X, true_labels, predictions)
-
-        result_df.to_csv(output_file, index=False)
-        print(f"\nSaved predictions to {output_file}")
-
-        return result_df
-
-
-    def save_predictions(self, X: pd.DataFrame, predictions: torch.Tensor, output_file: str, true_labels: pd.Series = None):
-        """Save predictions along with input data, probabilities, and verification analysis"""
-        predictions = predictions.cpu()
-        result_df = X.copy()
-        pred_labels = self.label_encoder.inverse_transform(predictions.numpy())
-        result_df['predicted_class'] = pred_labels
-
-        if true_labels is not None:
-            result_df['true_class'] = true_labels
-
-        # Get preprocessed features for probability computation
-        X_processed = self._preprocess_data(X, is_training=False)
-        X_tensor = torch.FloatTensor(X_processed).to(self.device)
-
-        # Compute probabilities in batches
-        batch_size = 32
-        all_probabilities = []
-
-        for i in range(0, len(X_tensor), batch_size):
-            batch_end = min(i + batch_size, len(X_tensor))
-            batch_X = X_tensor[i:batch_end]
-
-            try:
-                if self.model_type == "Histogram":
-                    batch_probs, _ = self._compute_batch_posterior(batch_X)
-                elif self.model_type == "Gaussian":
-                    batch_probs, _ = self._compute_batch_posterior_std(batch_X)
-                else:
-                    raise ValueError(f"{self.model_type} is invalid")
-
-                all_probabilities.append(batch_probs.cpu().numpy())
-
-            except Exception as e:
-                print(f"Error computing probabilities for batch {i}: {str(e)}")
-                return None
-
-        if all_probabilities:
-            all_probabilities = np.vstack(all_probabilities)
-        else:
-            print("No probabilities were computed successfully")
-            return None
-
-        # Add probability columns for each class
-        for i, class_name in enumerate(self.label_encoder.classes_):
-            result_df[f'prob_{class_name}'] = all_probabilities[:, i]
-
-        result_df['max_probability'] = all_probabilities.max(axis=1)
-
-        if true_labels is not None:
-            # Verification analysis
-            print("\nVerifying classification accuracy:")
-            self.verify_classifications(X, true_labels, predictions)
-
-            # Print metrics for full dataset
-            print("\nFull Dataset Metrics:")
-            print(f"Total samples: {len(result_df)}")
-
-            # Calculate overall accuracy
-            accuracy = (result_df['predicted_class'] == result_df['true_class']).mean()
-            print(f"Overall accuracy: {accuracy:.4f}")
-
-            # Calculate class-wise accuracies
-            print("\nClass-wise accuracies:")
-            for class_name in self.label_encoder.classes_:
-                class_mask = result_df['true_class'] == class_name
-                class_accuracy = (result_df[class_mask]['predicted_class'] == class_name).mean()
-                class_samples = class_mask.sum()
-                print(f"Class {class_name}: {class_accuracy:.4f} ({class_samples} samples)")
-
-            # Confidence metrics
-            print("\nConfidence Metrics:")
-            true_indices = self.label_encoder.transform(true_labels)
-            true_probs = all_probabilities[np.arange(len(true_indices)), true_indices]
-            max_prob_indices = np.argmax(all_probabilities, axis=1)
-            correct_prediction = (true_indices == max_prob_indices)
-
-            n_classes = len(self.label_encoder.classes_)
-            confidence_threshold = 1.0 / n_classes
-            prob_columns = [f'prob_{class_label}' for class_label in self.label_encoder.classes_]
-
-            result_df['confidence_check'] = np.where(
-                (true_probs >= confidence_threshold) &
-                (true_probs == result_df[prob_columns].max(axis=1)) &
-                correct_prediction,
-                'Passed',
-                'Failed'
-            )
-
-            n_failed = (result_df['confidence_check'] == 'Failed').sum()
-            print(f"Confidence Check Summary:")
-            print(f"Total predictions: {len(result_df)}")
-            print(f"Failed (true class prob <= {confidence_threshold:.3f} or not max prob): {n_failed}")
-            print(f"Passed (true class prob > {confidence_threshold:.3f} and is max prob): {len(result_df) - n_failed}")
-
-            # Create and save confusion matrix
-            cm = confusion_matrix(true_labels, pred_labels)
-            plt.figure(figsize=(12, 10))
-            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                       xticklabels=self.label_encoder.classes_,
-                       yticklabels=self.label_encoder.classes_)
-            plt.title('Confusion Matrix')
-            plt.xlabel('Predicted Label')
-            plt.ylabel('True Label')
-            confusion_matrix_file = output_file.rsplit('.', 1)[0] + '_confusion_matrix.png'
-            plt.savefig(confusion_matrix_file, bbox_inches='tight')
-            plt.close()
-
-        # Create and save probability distribution plots
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 12))
-        ax1.hist(result_df['max_probability'], bins=50, color='lightblue', edgecolor='black')
-        if true_labels is not None:
-            ax1.axvline(x=confidence_threshold, color='red', linestyle='--', label='Confidence Threshold')
-        ax1.set_title('Distribution of Maximum Prediction Probabilities')
-        ax1.set_xlabel('Maximum Probability')
-        ax1.set_ylabel('Count')
-        ax1.legend()
-
-        for i, class_name in enumerate(self.label_encoder.classes_):
-            prob_col = f'prob_{class_name}'
-            ax2.hist(result_df[prob_col], bins=50, alpha=0.5, label=class_name)
-
-        if true_labels is not None:
-            ax2.axvline(x=confidence_threshold, color='red', linestyle='--', label='Confidence Threshold')
-        ax2.set_title('Distribution of Prediction Probabilities by Class')
-        ax2.set_xlabel('Probability')
-        ax2.set_ylabel('Count')
-        ax2.legend()
-
-        plt.tight_layout()
-        plot_file = output_file.rsplit('.', 1)[0] + '_probability_distributions.png'
-        plt.savefig(plot_file)
-        plt.close()
-
-        result_df.to_csv(output_file, index=False)
-        print(f"\nSaved predictions with probabilities to {output_file}")
-        if true_labels is not None:
-            print(f"Saved confusion matrix plot to {confusion_matrix_file}")
-        print(f"Saved probability distribution plots to {plot_file}")
-
-        return result_df
 #------------------------------------------------------------End of PP code ---------------------------------------------------
     def _compute_pairwise_likelihood(self, dataset, labels, feature_dims):
         """Compute pairwise likelihood PDFs"""
@@ -3952,12 +3880,12 @@ class DBNN(GPUDBNN):
                 if mapped_values:
                     mean_value = float(np.mean(mapped_values))
 
-                    # Convert to proper dtype
-                    if np.issubdtype(original_dtype, np.integer):
+                    # Convert to proper dtype based on original column type
+                    if pd.api.types.is_integer_dtype(original_dtype):
                         mean_value = int(round(mean_value))
 
-                    # Update unmapped values
-                    df_encoded.loc[unmapped, column] = mean_value
+                    # Update unmapped values with proper type casting
+                    df_encoded.loc[unmapped, column] = pd.Series([mean_value] * len(unmapped), index=unmapped).astype(original_dtype)
 
         # Verify no categorical columns remain
         remaining_object_cols = df_encoded.select_dtypes(include=['object']).columns
@@ -3970,6 +3898,81 @@ class DBNN(GPUDBNN):
         DEBUG.log(f"Categorical encoding complete. Shape: {df_encoded.shape}")
         return df_encoded
 
+    def save_predictions(self, X: pd.DataFrame, predictions: torch.Tensor, output_file: str, true_labels: pd.Series = None):
+        """Save predictions with proper class handling and probability computation"""
+        predictions = predictions.cpu()
+        result_df = X.copy()
+
+        # Convert predictions to original class labels
+        pred_labels = self.label_encoder.inverse_transform(predictions.numpy())
+        result_df['predicted_class'] = pred_labels
+
+        if true_labels is not None:
+            result_df['true_class'] = true_labels
+
+        # Get preprocessed features for probability computation
+        X_processed = self._preprocess_data(X, is_training=False)
+        X_tensor = torch.FloatTensor(X_processed).to(self.device)
+
+        # Compute probabilities in batches
+        batch_size = 32
+        all_probabilities = []
+
+        for i in range(0, len(X_tensor), batch_size):
+            batch_end = min(i + batch_size, len(X_tensor))
+            batch_X = X_tensor[i:batch_end]
+
+            try:
+                if self.model_type == "Histogram":
+                    batch_probs, _ = self._compute_batch_posterior(batch_X)
+                elif self.model_type == "Gaussian":
+                    batch_probs, _ = self._compute_batch_posterior_std(batch_X)
+                else:
+                    raise ValueError(f"{self.model_type} is invalid")
+
+                all_probabilities.append(batch_probs.cpu().numpy())
+
+            except Exception as e:
+                print(f"Error computing probabilities for batch {i}: {str(e)}")
+                return None
+
+        if all_probabilities:
+            all_probabilities = np.vstack(all_probabilities)
+        else:
+            print("No probabilities were computed successfully")
+            return None
+
+        # Ensure we're only using valid class indices
+        valid_classes = self.label_encoder.classes_
+        n_classes = len(valid_classes)
+
+        # Verify probability array shape matches number of classes
+        if all_probabilities.shape[1] != n_classes:
+            print(f"Warning: Probability array shape ({all_probabilities.shape}) doesn't match number of classes ({n_classes})")
+            # Adjust probabilities array if necessary
+            if all_probabilities.shape[1] > n_classes:
+                all_probabilities = all_probabilities[:, :n_classes]
+            else:
+                # Pad with zeros if needed
+                pad_width = ((0, 0), (0, n_classes - all_probabilities.shape[1]))
+                all_probabilities = np.pad(all_probabilities, pad_width, mode='constant')
+
+        # Add probability columns for each valid class
+        for i, class_name in enumerate(valid_classes):
+            if i < all_probabilities.shape[1]:  # Safety check
+                result_df[f'prob_{class_name}'] = all_probabilities[:, i]
+
+        # Add maximum probability
+        result_df['max_probability'] = all_probabilities.max(axis=1)
+
+        if true_labels is not None:
+            # Verification analysis
+            self.verify_classifications(X, true_labels, predictions)
+
+        result_df.to_csv(output_file, index=False)
+        print(f"\nSaved predictions to {output_file}")
+
+        return result_df
 #--------------------------------------------------------------------------------------------------------------
 
     def _save_model_components(self):
@@ -4222,140 +4225,7 @@ def configure_debug(config):
     else:
         DEBUG.disable()
 
-def load_global_config():
-    """Load global configuration parameters with improved handling"""
-    try:
-        def remove_comments(json_str):
-            # Remove single-line comments (//) and multi-line comments (/* */)
-            lines = []
-            in_multiline_comment = False
-            in_string = False
-            quote_char = None
-            i = 0
-            current_line = []
 
-            while i < len(json_str):
-                char = json_str[i]
-
-                # Handle string literals
-                if char in ['"', "'"] and (i == 0 or json_str[i-1] != '\\'):
-                    if not in_string:
-                        in_string = True
-                        quote_char = char
-                    elif char == quote_char:
-                        in_string = False
-                        quote_char = None
-
-                # Skip processing if we're in a string
-                if in_string:
-                    current_line.append(char)
-                    i += 1
-                    continue
-
-                # Handle multi-line comments
-                if not in_multiline_comment and char == '/' and i + 1 < len(json_str) and json_str[i + 1] == '*':
-                    in_multiline_comment = True
-                    i += 2
-                    continue
-                elif in_multiline_comment and char == '*' and i + 1 < len(json_str) and json_str[i + 1] == '/':
-                    in_multiline_comment = False
-                    i += 2
-                    continue
-                elif in_multiline_comment:
-                    i += 1
-                    continue
-
-                # Handle single-line comments
-                if char == '/' and i + 1 < len(json_str) and json_str[i + 1] == '/':
-                    # Skip to the end of the line
-                    while i < len(json_str) and json_str[i] != '\n':
-                        i += 1
-                    continue
-
-                # Handle newlines
-                if char == '\n':
-                    if current_line:
-                        lines.append(''.join(current_line))
-                    current_line = []
-                else:
-                    current_line.append(char)
-                i += 1
-
-            # Add the last line if it exists
-            if current_line:
-                lines.append(''.join(current_line))
-
-            return '\n'.join(line.strip() for line in lines if line.strip())
-
-        # Read and process the configuration file
-        with open("adaptive_dbnn.conf", 'r') as f:
-            config_str = f.read()
-
-        # Clean comments and parse JSON
-        clean_config = remove_comments(config_str)
-        config = json.loads(clean_config)
-
-        # Define globals
-        global Trials, cardinality_threshold, cardinality_tolerance
-        global LearningRate, TrainingRandomSeed, Epochs, TestFraction, Fresh
-        global Train, Train_only, Predict, Gen_Samples, EnableAdaptive, nokbd
-        global Train_device, modelType, use_previous_model
-
-        # Load training parameters
-        training_params = config['training_params']
-        Trials = training_params['trials']
-        cardinality_threshold = training_params['cardinality_threshold']
-        cardinality_tolerance = training_params['cardinality_tolerance']
-        LearningRate = training_params['learning_rate']
-        TrainingRandomSeed = training_params['random_seed']
-        Epochs = training_params['epochs']
-        TestFraction = training_params['test_fraction']
-        EnableAdaptive = training_params['enable_adaptive']
-        usekbd = training_params['use_interactive_kbd']
-        Train_device = training_params['compute_device']
-        modelType = training_params['modelType']
-        DEBUG.log(f"Using model type: {modelType}")
-
-        # Load execution flags
-        execution_flags = config['execution_flags']
-        Train = execution_flags['train']
-        Train_only = execution_flags['train_only']
-        Predict = execution_flags['predict']
-        Gen_Samples = execution_flags['gen_samples']
-        Fresh = execution_flags['fresh_start']
-        use_previous_model = execution_flags.get('use_previous_model', True)  # Default to True if not specified
-
-        DEBUG.log(f"Fresh training is set to: {Fresh}")
-        DEBUG.log(f"Use previous model is set to: {use_previous_model}")
-
-        nokbd = not usekbd
-        if Train_device == 'auto':
-            Train_device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-        print(f"System is set to work on {Train_device}")
-        if nokbd:
-            print("Interactive keys disabled")
-
-        return Fresh, use_previous_model  # Return both flags
-
-    except Exception as e:
-        print(f"Error loading configuration: {str(e)}")
-        # Set default values
-        LearningRate = 0.1
-        TrainingRandomSeed = 42
-        Epochs = 1000
-        TestFraction = 0.2
-        Train = True
-        Train_only = False
-        Predict = True
-        Gen_Samples = False
-        EnableAdaptive = True
-        nokbd = False
-        Train_device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        modelType = 'Gaussian'
-        use_previous_model = True
-        print("Using default values")
-        return False, True
 #-------------------------------------------------------unit test ----------------------------------
 import os
 import glob
