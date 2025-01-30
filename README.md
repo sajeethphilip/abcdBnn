@@ -1,6 +1,123 @@
+## Example
+ python bdbnn.py 
+``` 
+=== BDBNN Integrated Pipeline ===
 
-# BDBNN Pipeline User Manual
+This pipeline will:
+1. Process your image dataset through CDBNN to create features
+2. Create and configure necessary configuration files
+3. Process through ADBNN for classification
+4. Generate visualizations and diagnostics
 
+Enter dataset type (torchvision/custom): custom
+Enter dataset path: RingGalaxies/galaxies
+
+
+Processing dataset: galaxies
+Path: RingGalaxies/galaxies
+Type: custom
+
+DBNN Parameter Configuration
+----------------------------------------
+
+Select model type (Histogram/Gaussian) [default: Histogram]: 
+
+Number of trials [default: 100]: 
+Number of epochs [default: 1000]: 
+Learning rate [default: 0.1]: 
+
+Use GPU if available? (y/n) [default: y]: 
+Enable debug mode? (y/n) [default: n]: 
+Skip visualization generation? (y/n) [default: n]: 
+
+Creating configurations...
+
+Checking configurations for galaxies...
+Found existing configuration files in data/galaxies
+
+Would you like to edit the configuration files? (y/n): y
+
+Edit files...
+
+
+Running processing pipeline...
+
+Step 1: Running CDBNN processing...
+
+Running CDBNN processing with command: python cdbnn.py --data_type custom --data RingGalaxies/galaxies --config data/galaxies/galaxies.json
+2025-01-31 01:10:12,771 - INFO - Logging setup complete. Log file: logs/training_20250131_011012.log
+2025-01-31 01:10:12,771 - INFO - Starting CNN training process...
+2025-01-31 01:10:12,772 - INFO - Loading configuration from data/galaxies/galaxies.json
+2025-01-31 01:10:12,772 - INFO - Processing dataset...
+2025-01-31 01:10:12,783 - INFO - Found 2 class directories: ['NonRings', 'Rings']
+
+BDBNN Pipeline User ManualCreate train/test split from class directories? (y/n): n
+
+2025-01-31 01:45:07,855 - INFO - Created training directory structure in data/galaxies/train
+2025-01-31 01:45:07,855 - INFO - Dataset processed: train_dir=data/galaxies/train, test_dir=None
+2025-01-31 01:45:07,855 - INFO - Initializing CNN trainer...
+2025-01-31 01:45:08,317 - INFO - Latest checkpoint: Model/cnn_checkpoints/galaxies_best.pth
+2025-01-31 01:45:08,317 - INFO - Found previous checkpoint at Model/cnn_checkpoints/galaxies_best.pth
+2025-01-31 01:45:08,410 - INFO - Checkpoint loaded successfully
+2025-01-31 01:45:08,411 - INFO - Optimizer state loaded
+2025-01-31 01:45:08,411 - INFO - Training history loaded
+2025-01-31 01:45:08,411 - INFO - Successfully initialized model from checkpoint
+2025-01-31 01:45:08,430 - INFO - Starting model training...
+2025-01-31 01:45:14,097 - INFO - Epoch 20: Train [12632 samples] Loss 0.1529, Acc 94.21%                                     
+2025-01-31 01:45:14,111 - INFO - Saved latest checkpoint to Model/cnn_checkpoints/galaxies_checkpoint.pth
+2025-01-31 01:45:14,123 - INFO - Saved best checkpoint to Model/cnn_checkpoints/galaxies_best.pth
+2025-01-31 01:45:14,123 - INFO - Extracting features...
+Extracting features: 100%|██████████████████████████████████████████████████████████████| 395/395 [00:05<00:00, 74.08batch/s]
+2025-01-31 01:45:20,779 - INFO - Saved features to data/galaxies/galaxies.csv
+2025-01-31 01:45:20,780 - INFO - Features saved to data/galaxies/galaxies.csv
+2025-01-31 01:45:20,996 - INFO - Training history plot saved to data/galaxies/training_history.png
+2025-01-31 01:45:20,996 - INFO - Processing completed successfully!
+
+Step 2: Running DBNN processing...
+
+Running ADBNN processing with command: python adbnn.py --dataset galaxies --config data/galaxies/adaptive_dbnn.conf --use_gpu
+DBNN Dataset Processor
+========================================
+Found dataset pair:
+  Config: data/galaxies.conf
+  Data  : data/galaxies/galaxies.csv
+
+Found 1 dataset pair(s)
+
+============================================================
+Dataset: galaxies
+Config file: data/galaxies.conf
+Data file: data/galaxies/galaxies.csv
+============================================================
+
+Dataset Information:
+Dataset name: galaxies
+Configuration file: data/galaxies.conf (1.2 KB)
+Data file: data/galaxies/galaxies.csv (17927.9 KB)
+Model type: Not specified
+Process this dataset? (y/n): Please enter 'y' or 'n' y
+
+Using default data file: data/galaxies/galaxies.csv
+Inferred column names from CSV: ['feature_0', 'feature_1', 'feature_2', 'feature_3', 'feature_4', 'feature_5', 'feature_6', 'feature_7', 'feature_8', 'feature_9', 'feature_10', 'feature_11', 'feature_12', 'feature_13', 'feature_14', 'feature_15', 'feature_16', 'feature_17', 'feature_18', 'feature_19', 'feature_20', 'feature_21', 'feature_22', 'feature_23', 'feature_24', 'feature_25', 'feature_26', 'feature_27', 'feature_28', 'feature_29', 'feature_30', 'feature_31', 'feature_32', 'feature_33', 'feature_34', 'feature_35', 'feature_36', 'feature_37', 'feature_38', 'feature_39', 'feature_40', 'feature_41', 'feature_42', 'feature_43', 'feature_44', 'feature_45', 'feature_46', 'feature_47', 'feature_48', 'feature_49', 'feature_50', 'feature_51', 'feature_52', 'feature_53', 'feature_54', 'feature_55', 'feature_56', 'feature_57', 'feature_58', 'feature_59', 'feature_60', 'feature_61', 'feature_62', 'feature_63', 'feature_64', 'feature_65', 'feature_66', 'feature_67', 'feature_68', 'feature_69', 'feature_70', 'feature_71', 'feature_72', 'feature_73', 'feature_74', 'feature_75', 'feature_76', 'feature_77', 'feature_78', 'feature_79', 'feature_80', 'feature_81', 'feature_82', 'feature_83', 'feature_84', 'feature_85', 'feature_86', 'feature_87', 'feature_88', 'feature_89', 'feature_90', 'feature_91', 'feature_92', 'feature_93', 'feature_94', 'feature_95', 'feature_96', 'feature_97', 'feature_98', 'feature_99', 'feature_100', 'feature_101', 'feature_102', 'feature_103', 'feature_104', 'feature_105', 'feature_106', 'feature_107', 'feature_108', 'feature_109', 'feature_110', 'feature_111', 'feature_112', 'feature_113', 'feature_114', 'feature_115', 'feature_116', 'feature_117', 'feature_118', 'feature_119', 'feature_120', 'feature_121', 'feature_122', 'feature_123', 'feature_124', 'feature_125', 'feature_126', 'feature_127', 'target']
+Using default data file: data/galaxies/galaxies.csv
+Using default target column: 'target'
+
+[DEBUG] ====== Starting preprocessing ======
+Loading previous model state
+No previous model found - starting fresh
+[DEBUG] Weight initialization complete. Structure:
+- Number of classes: 2
+- Class 0: 1000 feature pairs
+- Class 1: 1000 feature pairs
+
+Round 1/1000
+Training set size: 4
+Test set size: 12628
+Training time for epoch 1 is: 83.15 seconds
+
+......
+
+```
 ## Overview
 The BDBNN Pipeline is an integrated system that combines CNN feature extraction with Bayesian probabilistic classification. It consists of three main components:
 
