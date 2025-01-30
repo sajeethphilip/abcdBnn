@@ -21,7 +21,7 @@ from itertools import combinations
 
 # Import the CDBNN and ADBNN modules
 from cdbnn import CNNTrainer, DatasetProcessor, ConfigManager
-from adbnn import DBNN, DatasetConfig
+from adbnn import DBNN, DatasetConfig,BinWeightUpdater
 
 class Colors:
     """ANSI color codes for terminal output"""
@@ -1068,8 +1068,77 @@ def print_usage():
     print("                    --model-type Gaussian --trials 200 --dbnn-epochs 2000 \\")
     print("                    --input-size 299,299 --feature-dims 256")
 
+# Add to bdbnn.py
+
+def run_adbnn_process(dataset_name: str, config_path: str, use_gpu: bool = True, debug: bool = False) -> bool:
+    """Run ADBNN process with proper arguments
+
+    Args:
+        dataset_name: Name of the dataset
+        config_path: Path to configuration file
+        use_gpu: Whether to use GPU
+        debug: Whether to enable debug mode
+
+    Returns:
+        bool: True if process succeeded, False otherwise
+    """
+    try:
+        # Build command line arguments
+        cmd = [
+            "python",
+            "adbnn.py",
+            "--dataset", dataset_name,
+            "--config", config_path
+        ]
+
+        # Add GPU flag if needed
+        if use_gpu and torch.cuda.is_available():
+            cmd.append("--use_gpu")
+        else:
+            cmd.append("--cpu")
+
+        # Add debug flag
+        if debug:
+            cmd.append("--debug")
+
+        # Run ADBNN with real-time output
+        print(f"\nRunning ADBNN processing with command: {' '.join(cmd)}")
+
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+            bufsize=1
+        )
+
+        # Process and display output in real-time
+        output_lines = []
+        while True:
+            line = process.stdout.readline()
+            if not line and process.poll() is not None:
+                break
+            if line:
+                print(line.rstrip())
+                output_lines.append(line)
+
+        return_code = process.wait()
+
+        if return_code != 0:
+            print(f"\nError in ADBNN processing - return code: {return_code}")
+            return False
+
+        return True
+
+    except Exception as e:
+        print(f"\nError running ADBNN: {str(e)}")
+        if debug:
+            traceback.print_exc()
+        return False
+
+# Then modify the run_processing_pipeline function:
 def run_processing_pipeline(dataset_name: str, dataset_path: str, dataset_type: str,
-                          cnn_config_path: str, dbnn_config_path: str, args=None):
+                          cnn_config_path: str, dbnn_config_path: str, args):
     """Run the complete processing pipeline"""
     try:
         # Step 1: Run CDBNN processing
@@ -1085,22 +1154,15 @@ def run_processing_pipeline(dataset_name: str, dataset_path: str, dataset_type: 
 
         # Step 2: Run DBNN processing
         print("\nStep 2: Running DBNN processing...")
-        from adbnn import  DBNN  # Import here to avoid circular imports
-        dbnn = DBNN(dataset_name=dataset_name)
-        results = dbnn.process_dataset(dbnn_config_path)
+        if not run_adbnn_process(
+            dataset_name=dataset_name,
+            config_path=dbnn_config_path,
+            use_gpu=not getattr(args, 'cpu', False),
+            debug=getattr(args, 'debug', False)
+        ):
+            raise Exception("ADBNN processing failed")
 
-        # Step 3: Generate visualizations
-        if not getattr(args, 'skip_visuals', False):
-            print("\nStep 3: Generating visualizations...")
-            viz_dir = Path(f'data/{dataset_name}/visualizations')
-            viz_dir.mkdir(parents=True, exist_ok=True)
-
-            features_path = os.path.join('data', dataset_name, f"{dataset_name}.csv")
-            if os.path.exists(features_path):
-                data = pd.read_csv(features_path)
-                # Call visualization functions here
-
-        print(f"\nResults saved in: data/{dataset_name}/")
+        # Rest of the visualization code...
         return True
 
     except Exception as e:

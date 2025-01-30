@@ -342,6 +342,41 @@ class DatasetProcessor:
             logger.error(f"Error writing configuration to {file_path}: {str(e)}")
             raise
 
+    def _detect_image_properties(self, folder_path: str) -> Tuple[Tuple[int, int], int]:
+        """Detect image size and channels from actual images in the dataset"""
+        img_formats = self.SUPPORTED_IMAGE_EXTENSIONS
+        size_counts = defaultdict(int)
+        channel_counts = defaultdict(int)
+
+        for root, _, files in os.walk(folder_path):
+            for file in files:
+                if any(file.lower().endswith(ext) for ext in img_formats):
+                    try:
+                        with Image.open(os.path.join(root, file)) as img:
+                            # Convert to tensor to properly handle channels and dimensions
+                            tensor = transforms.ToTensor()(img)
+                            height, width = tensor.shape[1], tensor.shape[2]
+                            channels = tensor.shape[0]
+
+                            size_counts[(width, height)] += 1
+                            channel_counts[channels] += 1
+                    except Exception as e:
+                        logger.warning(f"Could not read image {file}: {str(e)}")
+                        continue
+
+            # Stop after checking 50 images to balance accuracy vs performance
+            if sum(size_counts.values()) >= 50:
+                break
+
+        if not size_counts:
+            raise ValueError(f"No valid images found in {folder_path}")
+
+        # Get most common dimensions and channels
+        input_size = max(size_counts, key=size_counts.get)
+        in_channels = max(channel_counts, key=channel_counts.get)
+
+        return input_size, in_channels
+
     def generate_default_config(self, folder_path: str) -> Dict[str, Dict]:
         """
         Generate three configuration files with exact structure and comments.
@@ -356,6 +391,20 @@ class DatasetProcessor:
             train_folder = os.path.join(folder_path, 'train')
             if not os.path.exists(train_folder):
                 raise ValueError(f"Training directory not found: {train_folder}")
+
+            # Detect properties from actual images (works for both custom and torchvision datasets)
+            input_size, in_channels = self._detect_image_properties(train_folder)
+            # Get normalization values based on detected channels
+            if in_channels == 1:  # Grayscale
+                mean = [0.5]
+                std = [0.5]
+            elif in_channels == 3:  # Color
+                mean = [0.485, 0.456, 0.406]
+                std = [0.229, 0.224, 0.225]
+            else:
+                logger.warning(f"Unusual channel count {in_channels}, using default normalization")
+                mean = [0.5] * in_channels
+                std = [0.5] * in_channels
 
             # Find first valid image
             first_image_path = next(
@@ -379,9 +428,7 @@ class DatasetProcessor:
             if num_classes == 0:
                 raise ValueError(f"No class directories found in {train_folder}")
 
-            # Set normalization parameters
-            mean = [0.485, 0.456, 0.406] if in_channels == 3 else [0.5]
-            std = [0.229, 0.224, 0.225] if in_channels == 3 else [0.5]
+
 
             # 1. Generate main JSON config
             json_config = {
