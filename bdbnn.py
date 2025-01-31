@@ -6,6 +6,11 @@ import torch
 import random
 import pandas as pd
 import numpy as np
+import torchvision
+import zipfile
+import tarfile
+import shutil
+from PIL import Image
 import plotly.express as px
 import plotly.graph_objects as go
 from sklearn.preprocessing import StandardScaler
@@ -197,189 +202,110 @@ class BDBNNVisualizer:
         fig_corr.write_html(
             str(epoch_viz_dir / f'correlation_matrix_{set_type}.html'))
 
-def create_default_configs(dataset_name: str, dataset_path: str, dataset_type: str, args=None) -> Tuple[str, str]:
-    """Create default configuration files for CNN and DBNN if they don't exist
+def create_default_configs(input_path: str, args=None) -> Tuple[str, str]:
+    """Create configuration files based on actual dataset properties"""
 
-    Args:
-        dataset_name: Name of the dataset
-        dataset_path: Path to dataset
-        dataset_type: Type of dataset (torchvision/custom)
-        args: Command line arguments (optional)
-    """
-    print(f"\nChecking configurations for {dataset_name}...")
+    # Initialize dataset handler
+    handler = DatasetHandler()
 
-    # Create data directory if it doesn't exist
-    os.makedirs('data', exist_ok=True)
-    # Create dataset-specific directory
-    dataset_dir = os.path.join('data', dataset_name)
-    os.makedirs(dataset_dir, exist_ok=True)
+    try:
+        # Analyze dataset
+        dataset_props = handler.analyze_dataset(input_path)
+        dataset_name = dataset_props['name']
 
-    # Ensure train directory exists
-    train_dir = os.path.join(dataset_dir, 'train')
-    os.makedirs(train_dir, exist_ok=True)
+        # Define config paths
+        config_dir = Path('data') / dataset_name
+        cnn_config_path = config_dir / f"{dataset_name}.json"
+        dbnn_config_path = config_dir / "adaptive_dbnn.conf"
 
-    # Define config file paths
-    cnn_config_path = os.path.join('data', dataset_name, f"{dataset_name}.json")
-    dbnn_config_path = os.path.join('data', dataset_name, "adaptive_dbnn.conf")
-    data_config_path = os.path.join('data', dataset_name, f"{dataset_name}.conf")
+        # Check if configs already exist
+        if cnn_config_path.exists() and dbnn_config_path.exists():
+            print(f"Found existing configuration files in {config_dir}")
+            return str(cnn_config_path), str(dbnn_config_path)
 
-    # Check if config files already exist
-    configs_exist = os.path.exists(cnn_config_path) and os.path.exists(dbnn_config_path) and os.path.exists(data_config_path)
+        print("Creating new configuration files...")
 
-    if configs_exist:
-        print(f"Found existing configuration files in {dataset_dir}")
-        return cnn_config_path, dbnn_config_path
-
-    print("Creating new configuration files...")
-
-    # Get number of classes from directory structure
-    if os.path.isdir(dataset_path):
-        num_classes = len([d for d in os.listdir(dataset_path)
-                          if os.path.isdir(os.path.join(dataset_path, d))])
-    else:
-        num_classes = 2  # Default if cannot determine
-
-    # Parse input size from args or use default
-    if args and args.input_size:
-        try:
-            width, height = map(int, args.input_size.split(','))
-            input_size = [width, height]
-        except:
-            input_size = [224, 224]  # Default if parsing fails
-    else:
-        input_size = [224, 224]
-
-    # Create CNN config
-    cnn_config = {
-        "_comment": "CNN configuration file",
-        "dataset": {
-            "_comment": "Dataset configuration",
-            "name": dataset_name,
-            "type": dataset_type,
-            "_comment_type": "Use 'torchvision' for built-in datasets",
-            "in_channels": 3,
-            "num_classes": num_classes,
-            "input_size": input_size,
-            "mean": [0.485, 0.456, 0.406],
-            "std": [0.229, 0.224, 0.225],
-            "train_dir": train_dir,
-            "test_dir": os.path.join(dataset_dir, 'test')
-        },
-        "model": {
-            "_comment": "Model architecture settings",
-            "feature_dims": args.feature_dims if args and args.feature_dims else 128,
-            "learning_rate": args.learning_rate if args and args.learning_rate else 0.001
-        },
-        "training": {
-            "_comment": "Training parameters",
-            "batch_size": args.batch_size if args and args.batch_size else 32,
-            "epochs": args.epochs if args and args.epochs else 20,
-            "num_workers": args.workers if args and args.workers else min(4, os.cpu_count() or 1),
-            "cnn_training": {
-                "_comment": "CNN specific training settings",
-                "resume": True,
-                "fresh_start": args.fresh if args and args.fresh else False,
-                "min_loss_threshold": 0.01,
-                "checkpoint_dir": "Model/cnn_checkpoints"
+        # Create CNN config
+        cnn_config = {
+            "_comment": "CNN configuration file",
+            "dataset": {
+                "_comment": "Dataset configuration",
+                "name": dataset_name,
+                "type": dataset_props['type'],
+                "in_channels": dataset_props['in_channels'],
+                "num_classes": dataset_props['num_classes'],
+                "input_size": dataset_props['input_size'],
+                "mean": dataset_props['mean'],
+                "std": dataset_props['std'],
+                "train_dir": dataset_props['train_dir'],
+                "test_dir": dataset_props['test_dir'],
+                "classes": dataset_props['classes']
+            },
+            "model": {
+                "_comment": "Model architecture settings",
+                "feature_dims": args.feature_dims if args and args.feature_dims else 128,
+                "learning_rate": args.learning_rate if args and args.learning_rate else 0.001
+            },
+            "training": {
+                "_comment": "Training parameters",
+                "batch_size": args.batch_size if args and args.batch_size else 32,
+                "epochs": args.epochs if args and args.epochs else 20,
+                "num_workers": args.workers if args and args.workers else min(4, os.cpu_count() or 1),
+                "cnn_training": {
+                    "_comment": "CNN specific training settings",
+                    "resume": True,
+                    "fresh_start": args.fresh if args and args.fresh else False,
+                    "min_loss_threshold": 0.01,
+                    "checkpoint_dir": "Model/cnn_checkpoints"
+                }
+            },
+            "execution_flags": {
+                "_comment": "Execution control flags",
+                "mode": "train_and_predict",
+                "_comment_mode": "Options: train_and_predict, train_only, predict_only",
+                "use_gpu": args.use_gpu if args and hasattr(args, 'use_gpu') else torch.cuda.is_available(),
+                "fresh_start": args.fresh if args and args.fresh else False
             }
-        },
-        "execution_flags": {
-            "_comment": "Execution control flags",
-            "mode": "train_and_predict",
-            "_comment_mode": "Options: train_and_predict, train_only, predict_only",
-            "use_gpu": args.use_gpu if args and hasattr(args, 'use_gpu') else torch.cuda.is_available(),
-            "fresh_start": args.fresh if args and args.fresh else False
         }
-    }
 
-    # Create DBNN config
-    dbnn_config = {
-        "_comment": "Configuration file for Adaptive DBNN training and execution",
-        "training_params": {
-            "_comment": "Basic training parameters",
-            "trials": args.trials if args and args.trials else 100,
-            "cardinality_threshold": 0.9,
-            "cardinality_tolerance": 4,
-            "learning_rate": args.dbnn_lr if args and args.dbnn_lr else 0.1,
-            "random_seed": 42,
-            "epochs": args.dbnn_epochs if args and args.dbnn_epochs else 1000,
-            "test_fraction": args.val_split if args and args.val_split else 0.2,
-            "enable_adaptive": True,
-
-            "_comment_2": "Model and computation settings",
-            "modelType": args.model_type if args and args.model_type else "Histogram",
-            "compute_device": "auto",
-            "use_interactive_kbd": False,
-            "debug_enabled": args.debug if args and args.debug else False,
-
-            "_comment_3": "Training data management",
-            "Save_training_epochs": True,
-            "training_save_path": os.path.join("training_data", dataset_name)
-        },
-        "execution_flags": {
-            "_comment": "Execution control flags",
-            "train": True,
-            "train_only": False,
-            "predict": True,
-            "gen_samples": False,
-            "fresh_start": args.fresh if args and args.fresh else False,
-            "use_previous_model": not (args and args.fresh)
+        # Create DBNN config
+        dbnn_config = {
+            "_comment": "Configuration file for Adaptive DBNN training and execution",
+            "training_params": {
+                "_comment": "Basic training parameters",
+                "trials": args.trials if args and args.trials else 100,
+                "cardinality_threshold": 0.9,
+                "cardinality_tolerance": 4,
+                "learning_rate": args.dbnn_lr if args and args.dbnn_lr else 0.1,
+                "random_seed": 42,
+                "epochs": args.dbnn_epochs if args and args.dbnn_epochs else 1000,
+                "test_fraction": args.val_split if args and args.val_split else 0.2,
+                "enable_adaptive": True,
+                "modelType": args.model_type if args and args.model_type else "Histogram",
+                "compute_device": "auto",
+                "use_interactive_kbd": False,
+                "debug_enabled": args.debug if args and args.debug else False,
+                "Save_training_epochs": True,
+                "training_save_path": str(Path("training_data") / dataset_name)
+            }
         }
-    }
 
-    # Create data configuration
-    data_config = {
-        "_comment": "Main data configuration file",
-        "file_path": os.path.join("data", dataset_name, f"{dataset_name}.csv"),
-        "_comment_filepath": "Can also be a URL for remote datasets",
-        "separator": ",",
-        "has_header": True,
-        "target_column": "target",
+        # Save configurations
+        config_dir.mkdir(parents=True, exist_ok=True)
 
-        "likelihood_config": {
-            "_comment": "Settings for likelihood computation",
-            "feature_group_size": 2,
-            "max_combinations": 1000,
-            "bin_sizes": [20],
-            "_comment_bins": "Can be variable sizes for each feature, e.g. [20,33,64]"
-        },
-
-        "active_learning": {
-            "_comment": "Active learning parameters",
-            "tolerance": 1.0,
-            "cardinality_threshold_percentile": 95,
-            "strong_margin_threshold": 0.3,
-            "marginal_margin_threshold": 0.1,
-            "min_divergence": 0.1
-        },
-
-        "training_params": {
-            "_comment": "Dataset-specific training parameters",
-            "Save_training_epochs": True,
-            "training_save_path": os.path.join("training_data", dataset_name)
-        },
-
-        "modelType": args.model_type if args and args.model_type else "Histogram"
-    }
-
-    # Save configurations only if they don't exist
-    if not os.path.exists(cnn_config_path):
         with open(cnn_config_path, 'w') as f:
             json.dump(cnn_config, f, indent=4)
-        print(f"Created CNN config: {cnn_config_path}")
 
-    if not os.path.exists(dbnn_config_path):
         with open(dbnn_config_path, 'w') as f:
             json.dump(dbnn_config, f, indent=4)
-        print(f"Created DBNN config: {dbnn_config_path}")
 
-    if not os.path.exists(data_config_path):
-        with open(data_config_path, 'w') as f:
-            json.dump(data_config, f, indent=4)
-        print(f"Created data config: {data_config_path}")
+        print(f"Created configuration files in {config_dir}")
 
-    return cnn_config_path, dbnn_config_path
+        return str(cnn_config_path), str(dbnn_config_path)
 
+    except Exception as e:
+        logging.error(f"Error creating configurations: {str(e)}", exc_info=True)
+        raise
 def run_cdbnn_process(dataset_path: str, dataset_type: str, config_path: str = None, use_gpu: bool = True, debug: bool = False) -> bool:
     """Run CDBNN process with proper arguments
 
@@ -1171,8 +1097,392 @@ def run_processing_pipeline(dataset_name: str, dataset_path: str, dataset_type: 
             traceback.print_exc()
         return False
 
+class DatasetHandler:
+    """Handles dataset loading and property detection for various input types"""
+
+    def __init__(self, base_data_dir: str = 'data'):
+        self.base_data_dir = Path(base_data_dir)
+        self.base_data_dir.mkdir(parents=True, exist_ok=True)
+        self.logger = logging.getLogger(__name__)
+
+        # Map of supported torchvision datasets and their properties
+        self.torchvision_datasets = {
+            'MNIST': {
+                'class': torchvision.datasets.MNIST,
+                'channels': 1,
+                'size': [28, 28],
+                'mean': [0.1307],
+                'std': [0.3081]
+            },
+            'CIFAR10': {
+                'class': torchvision.datasets.CIFAR10,
+                'channels': 3,
+                'size': [32, 32],
+                'mean': [0.4914, 0.4822, 0.4465],
+                'std': [0.2470, 0.2435, 0.2616]
+            },
+            'CIFAR100': {
+                'class': torchvision.datasets.CIFAR100,
+                'channels': 3,
+                'size': [32, 32],
+                'mean': [0.5071, 0.4867, 0.4408],
+                'std': [0.2675, 0.2565, 0.2761]
+            }
+        }
+
+    def _extract_archive(self, archive_path: str, extract_dir: Path) -> Path:
+        """
+        Extract compressed archives (zip, tar, etc)
+
+        Args:
+            archive_path: Path to the archive file
+            extract_dir: Directory to extract to
+
+        Returns:
+            Path: Path to the root directory containing images
+        """
+        archive_path = Path(archive_path)
+
+        if zipfile.is_zipfile(archive_path):
+            with zipfile.ZipFile(archive_path, 'r') as zip_ref:
+                zip_ref.extractall(extract_dir)
+        elif tarfile.is_tarfile(archive_path):
+            with tarfile.open(archive_path, 'r:*') as tar_ref:
+                tar_ref.extractall(extract_dir)
+        else:
+            raise ValueError(f"Unsupported archive format: {archive_path}")
+
+        # Find the root directory containing images
+        image_dirs = []
+        for root, dirs, files in os.walk(extract_dir):
+            if any(f.lower().endswith(('.jpg', '.jpeg', '.png', '.gif')) for f in files):
+                image_dirs.append(root)
+
+        if not image_dirs:
+            raise ValueError("No image files found in archive")
+
+        # Use the most shallow directory containing images
+        return Path(min(image_dirs, key=lambda x: len(Path(x).parts)))
+
+    def _setup_dataset_directory(self, input_path: str) -> Tuple[Path, str]:
+        """
+        Setup dataset directory structure and determine dataset name
+
+        Args:
+            input_path: Path to the input dataset
+
+        Returns:
+            Tuple[Path, str]: (data root directory, dataset name)
+        """
+        input_path = Path(input_path)
+
+        # Handle different input types
+        if input_path.is_file():
+            if input_path.suffix.lower() in ['.zip', '.tar', '.gz', '.tgz']:
+                # Compressed archive
+                dataset_name = input_path.stem
+                dataset_dir = self.base_data_dir / dataset_name
+                if not dataset_dir.exists():
+                    dataset_dir.mkdir(parents=True)
+                    data_root = self._extract_archive(input_path, dataset_dir)
+                else:
+                    data_root = next(dataset_dir.glob("*"))  # First subdirectory
+            else:
+                raise ValueError(f"Unsupported file type: {input_path}")
+        elif input_path.is_dir():
+            # Directory containing images
+            dataset_name = input_path.name
+            dataset_dir = self.base_data_dir / dataset_name
+            if not dataset_dir.exists():
+                shutil.copytree(input_path, dataset_dir)
+            data_root = dataset_dir
+        else:
+            raise ValueError(f"Input path does not exist: {input_path}")
+
+        return data_root, dataset_name
+
+    def _analyze_image_properties(self, image_path: Path) -> Tuple[int, List[int]]:
+        """
+        Analyze image to determine channels and size
+
+        Args:
+            image_path: Path to the image file
+
+        Returns:
+            Tuple[int, List[int]]: (number of channels, [width, height])
+        """
+        with Image.open(image_path) as img:
+            if img.mode == 'L':
+                channels = 1
+            elif img.mode == 'RGB':
+                channels = 3
+            elif img.mode == 'RGBA':
+                channels = 4
+            else:
+                channels = 1  # Default to grayscale
+
+            size = list(img.size)
+            return channels, size
+
+    def _compute_dataset_stats(self, data_root: Path, channels: int) -> Tuple[List[float], List[float]]:
+        """
+        Compute actual dataset mean and std
+
+        Args:
+            data_root: Root directory of the dataset
+            channels: Number of image channels
+
+        Returns:
+            Tuple[List[float], List[float]]: (mean per channel, std per channel)
+        """
+        image_files = []
+        for ext in ['.jpg', '.jpeg', '.png', '.gif']:
+            image_files.extend(data_root.rglob(f'*{ext}'))
+
+        if not image_files:
+            return [0.5] * channels, [0.5] * channels
+
+        # Sample up to 1000 images for statistics
+        sample_size = min(1000, len(image_files))
+        sampled_files = np.random.choice(image_files, sample_size, replace=False)
+
+        # Accumulate statistics
+        means = []
+        stds = []
+
+        for img_path in sampled_files:
+            with Image.open(img_path) as img:
+                if img.mode != ('L' if channels == 1 else 'RGB'):
+                    img = img.convert('L' if channels == 1 else 'RGB')
+                img_array = np.array(img) / 255.0
+                if channels == 1:
+                    img_array = img_array[..., np.newaxis]
+                means.append(img_array.mean(axis=(0, 1)))
+                stds.append(img_array.std(axis=(0, 1)))
+
+        # Compute overall statistics
+        mean = np.mean(means, axis=0).tolist()
+        std = np.mean(stds, axis=0).tolist()
+
+        return mean, std
+
+    def _get_torchvision_dataset(self, dataset_name: str) -> Dict:
+        """
+        Get or download torchvision dataset and return its properties
+
+        Args:
+            dataset_name: Name of the torchvision dataset (e.g., 'MNIST', 'CIFAR10')
+
+        Returns:
+            Dict containing dataset properties
+        """
+        dataset_name = dataset_name.upper()
+        if dataset_name not in self.torchvision_datasets:
+            raise ValueError(f"Unsupported torchvision dataset: {dataset_name}")
+
+        dataset_info = self.torchvision_datasets[dataset_name]
+        dataset_dir = self.base_data_dir / dataset_name
+
+        print(f"\nChecking for {dataset_name} dataset...")
+
+        try:
+            # Try to download/load training set to get properties
+            train_dataset = dataset_info['class'](
+                root=str(self.base_data_dir),
+                train=True,
+                download=True
+            )
+
+            # Try to download/load test set
+            test_dataset = dataset_info['class'](
+                root=str(self.base_data_dir),
+                train=False,
+                download=True
+            )
+
+            num_classes = len(train_dataset.classes)
+            classes = train_dataset.classes
+
+            # Setup train/test directories if needed
+            train_dir = dataset_dir / 'train'
+            test_dir = dataset_dir / 'test'
+            train_dir.mkdir(parents=True, exist_ok=True)
+            test_dir.mkdir(parents=True, exist_ok=True)
+
+            return {
+                'name': dataset_name,
+                'type': 'torchvision',
+                'in_channels': dataset_info['channels'],
+                'num_classes': num_classes,
+                'input_size': dataset_info['size'],
+                'mean': dataset_info['mean'],
+                'std': dataset_info['std'],
+                'train_dir': str(train_dir),
+                'test_dir': str(test_dir),
+                'classes': classes,
+                'data_root': str(dataset_dir)
+            }
+
+        except Exception as e:
+            self.logger.error(f"Error downloading/loading {dataset_name}: {str(e)}")
+            raise
+
+    def analyze_dataset(self, input_path: str) -> Dict:
+        """
+        Analyze dataset and return its properties
+
+        Args:
+            input_path: Path to dataset (directory, zip, tar file) or torchvision dataset name
+
+        Returns:
+            Dict containing dataset properties
+        """
+        # Check if this is a torchvision dataset
+        if isinstance(input_path, str) and input_path in self.torchvision_datasets:
+            return self._get_torchvision_dataset(input_path)
+
+        # Setup directory structure for local dataset
+        data_root, dataset_name = self._setup_dataset_directory(input_path)
+
+        # Detect classes (subdirectories)
+        classes = []
+        if data_root.is_dir():
+            classes = [d.name for d in data_root.iterdir() if d.is_dir()]
+
+        if not classes:
+            # No subdirectories - check for image files directly
+            image_files = []
+            for ext in ['.jpg', '.jpeg', '.png', '.gif']:
+                image_files.extend(data_root.rglob(f'*{ext}'))
+            if not image_files:
+                raise ValueError(f"No image files found in {data_root}")
+            # Single class dataset
+            classes = ['default']
+
+        # Analyze first image for basic properties
+        first_image = None
+        for class_dir in classes:
+            if class_dir == 'default':
+                search_dir = data_root
+            else:
+                search_dir = data_root / class_dir
+
+            for ext in ['.jpg', '.jpeg', '.png', '.gif']:
+                images = list(search_dir.rglob(f'*{ext}'))
+                if images:
+                    first_image = images[0]
+                    break
+            if first_image:
+                break
+
+        if not first_image:
+            raise ValueError("No valid image files found")
+
+        # Get image properties
+        channels, input_size = self._analyze_image_properties(first_image)
+
+        # Compute dataset statistics
+        mean, std = self._compute_dataset_stats(data_root, channels)
+
+        # Prepare train/test directories
+        train_dir = self.base_data_dir / dataset_name / 'train'
+        test_dir = self.base_data_dir / dataset_name / 'test'
+        train_dir.mkdir(parents=True, exist_ok=True)
+        test_dir.mkdir(parents=True, exist_ok=True)
+
+        # Return dataset properties
+        return {
+            'name': dataset_name,
+            'type': 'custom',
+            'in_channels': channels,
+            'num_classes': len(classes),
+            'input_size': input_size,
+            'mean': mean,
+            'std': std,
+            'train_dir': str(train_dir),
+            'test_dir': str(test_dir),
+            'classes': classes,
+            'data_root': str(data_root)
+        }
+
+    def analyze_dataset(self, input_path: str) -> Dict:
+        """
+        Analyze dataset and return its properties
+
+        Args:
+            input_path: Path to dataset (directory, zip, or tar file)
+
+        Returns:
+            Dict containing dataset properties
+        """
+        # Setup directory structure
+        data_root, dataset_name = self._setup_dataset_directory(input_path)
+
+        # Detect classes (subdirectories)
+        classes = []
+        if data_root.is_dir():
+            classes = [d.name for d in data_root.iterdir() if d.is_dir()]
+
+        if not classes:
+            # No subdirectories - check for image files directly
+            image_files = []
+            for ext in ['.jpg', '.jpeg', '.png', '.gif']:
+                image_files.extend(data_root.rglob(f'*{ext}'))
+            if not image_files:
+                raise ValueError(f"No image files found in {data_root}")
+            # Single class dataset
+            classes = ['default']
+
+        # Analyze first image for basic properties
+        first_image = None
+        for class_dir in classes:
+            if class_dir == 'default':
+                search_dir = data_root
+            else:
+                search_dir = data_root / class_dir
+
+            for ext in ['.jpg', '.jpeg', '.png', '.gif']:
+                images = list(search_dir.rglob(f'*{ext}'))
+                if images:
+                    first_image = images[0]
+                    break
+            if first_image:
+                break
+
+        if not first_image:
+            raise ValueError("No valid image files found")
+
+        # Get image properties
+        channels, input_size = self._analyze_image_properties(first_image)
+
+        # Compute dataset statistics
+        mean, std = self._compute_dataset_stats(data_root, channels)
+
+        # Prepare train/test directories
+        train_dir = self.base_data_dir / dataset_name / 'train'
+        test_dir = self.base_data_dir / dataset_name / 'test'
+        train_dir.mkdir(parents=True, exist_ok=True)
+        test_dir.mkdir(parents=True, exist_ok=True)
+
+        # Return dataset properties
+        return {
+            'name': dataset_name,
+            'type': 'custom',
+            'in_channels': channels,
+            'num_classes': len(classes),
+            'input_size': input_size,
+            'mean': mean,
+            'std': std,
+            'train_dir': str(train_dir),
+            'test_dir': str(test_dir),
+            'classes': classes,
+            'data_root': str(data_root)
+        }
+
+
+
 def main():
-    """Main execution function with fixed process calls"""
+    """Main execution function with dynamic dataset handling"""
     args = handle_command_line_args()
 
     if args.help:
@@ -1188,23 +1498,49 @@ def main():
         print("4. Generate visualizations and diagnostics")
 
         # Get dataset information
-        if args.data_type and args.data:
-            dataset_type = args.data_type
+        if args.data and args.data_type:
             dataset_path = args.data
+            dataset_type = args.data_type
         else:
-            dataset_type = input("\nEnter dataset type (torchvision/custom): ").strip().lower()
-            while dataset_type not in ['torchvision', 'custom']:
-                print("Invalid type. Please enter 'torchvision' or 'custom'")
-                dataset_type = input("Enter dataset type: ").strip().lower()
+            dataset_path, dataset_type = get_dataset_info()
 
-            dataset_path = input("Enter dataset path: ").strip()
+        # Keep original path case
+        dataset_name = dataset_path if dataset_type == 'torchvision' else os.path.basename(os.path.normpath(dataset_path))
 
-        dataset_name = os.path.basename(os.path.normpath(dataset_path))
-        if dataset_type=='torchvision':
-            dataset_name=dataset_name.upper()
-        print(f"\nProcessing dataset: {dataset_name}")
-        print(f"Path: {dataset_path}")
-        print(f"Type: {dataset_type}")
+        # Initialize DatasetProcessor
+        processor = DatasetProcessor(
+            datafile=dataset_path,
+            datatype=dataset_type,
+            output_dir='data'
+        )
+
+        # Process dataset first
+        print("\nProcessing dataset...")
+        train_dir, test_dir = processor.process()
+
+        # Check if we have both train and test directories and in Histogram mode
+        merge_datasets = False
+        if test_dir and (args.model_type == "Histogram" if args.model_type else True):
+            merge_default = 'y'  # Default to yes for Histogram mode
+            merge_response = input(f"\nFound both train and test directories. Merge them for training? (Y/n) [default: {merge_default}]: ").strip().lower()
+            merge_datasets = merge_response in ['', 'y', 'yes'] if merge_default == 'y' else merge_response in ['y', 'yes']
+
+        # Now generate configuration
+        config_dict = processor.generate_default_config(os.path.dirname(train_dir))
+        config = config_dict["json_config"]  # This contains the proper structure
+
+        # Update config if merging datasets
+        if merge_datasets:
+            config['training']['merge_train_test'] = True
+
+        print("\nDataset processed:")
+        print(f"Training directory: {train_dir}")
+        print(f"Test directory: {test_dir}")
+        print(f"Number of channels: {config['dataset']['in_channels']}")
+        print(f"Number of classes: {config['dataset']['num_classes']}")
+        print(f"Input size: {config['dataset']['input_size']}")
+        if merge_datasets:
+            print("Datasets will be merged for training")
 
         # Get DBNN parameters interactively if no args provided
         if not args.no_interactive:
@@ -1214,21 +1550,62 @@ def main():
             model_type = input("\nSelect model type (Histogram/Gaussian) [default: Histogram]: ").strip()
             args.model_type = model_type if model_type in ["Histogram", "Gaussian"] else "Histogram"
 
-            args.trials = int(input("\nNumber of trials [default: 100]: ").strip() or "100")
-            args.dbnn_epochs = int(input("Number of epochs [default: 1000]: ").strip() or "1000")
-            args.dbnn_lr = float(input("Learning rate [default: 0.1]: ").strip() or "0.1")
+            trials_input = input("\nNumber of trials [default: 100]: ").strip()
+            args.trials = int(trials_input) if trials_input else 100
+
+            epochs_input = input("Number of epochs [default: 1000]: ").strip()
+            args.dbnn_epochs = int(epochs_input) if epochs_input else 1000
+
+            lr_input = input("Learning rate [default: 0.1]: ").strip()
+            args.dbnn_lr = float(lr_input) if lr_input else 0.1
+
             args.use_gpu = input("\nUse GPU if available? (y/n) [default: y]: ").lower().strip() != 'n'
             args.debug = input("Enable debug mode? (y/n) [default: n]: ").lower().strip() == 'y'
             args.skip_visuals = input("Skip visualization generation? (y/n) [default: n]: ").lower().strip() == 'y'
 
         # Create configurations
         print("\nCreating configurations...")
-        cnn_config_path, dbnn_config_path = create_default_configs(
-            dataset_name=dataset_name,
-            dataset_path=dataset_path,
-            dataset_type=dataset_type,
-            args=args
-        )
+        try:
+            # Save CNN config
+            dataset_dir = Path('data') / dataset_name
+            cnn_config_path = dataset_dir / f"{dataset_name}.json"
+            dbnn_config_path = dataset_dir / "adaptive_dbnn.conf"
+
+            dataset_dir.mkdir(parents=True, exist_ok=True)
+
+            # Save CNN config
+            with open(cnn_config_path, 'w') as f:
+                json.dump(config, f, indent=4)
+
+            # Generate and save DBNN config
+            dbnn_config = {
+                "training_params": {
+                    "trials": args.trials if args and args.trials else 100,
+                    "cardinality_threshold": 0.9,
+                    "cardinality_tolerance": 4,
+                    "learning_rate": args.dbnn_lr if args and args.dbnn_lr else 0.1,
+                    "random_seed": 42,
+                    "epochs": args.dbnn_epochs if args and args.dbnn_epochs else 1000,
+                    "test_fraction": args.val_split if args and args.val_split else 0.2,
+                    "enable_adaptive": True,
+                    "modelType": args.model_type if args and args.model_type else "Histogram",
+                    "compute_device": "auto",
+                    "use_interactive_kbd": False,
+                    "debug_enabled": args.debug if args and args.debug else False,
+                    "Save_training_epochs": True,
+                    "training_save_path": str(Path("training_data") / dataset_name),
+                    "merge_datasets": merge_datasets
+                }
+            }
+
+            with open(dbnn_config_path, 'w') as f:
+                json.dump(dbnn_config, f, indent=4)
+
+        except Exception as e:
+            print(f"Error creating configurations: {str(e)}")
+            if args.debug:
+                traceback.print_exc()
+            return 1
 
         # Allow configuration editing
         if not args.no_interactive:
@@ -1246,15 +1623,18 @@ def main():
         print("\nRunning processing pipeline...")
         success = run_processing_pipeline(
             dataset_name=dataset_name,
-            dataset_path=dataset_path,
+            dataset_path=dataset_path,  # Use original dataset path
             dataset_type=dataset_type,
-            cnn_config_path=cnn_config_path,
-            dbnn_config_path=dbnn_config_path,
+            cnn_config_path=str(cnn_config_path),
+            dbnn_config_path=str(dbnn_config_path),
             args=args
         )
 
         if not success:
             raise Exception("Pipeline processing failed")
+
+        print("\nPipeline execution completed successfully!")
+        return 0
 
     except Exception as e:
         print(f"\nError in pipeline execution: {str(e)}")
@@ -1262,8 +1642,6 @@ def main():
             print("\nFull error traceback:")
             traceback.print_exc()
         return 1
-
-    return 0
 
 if __name__ == "__main__":
     sys.exit(main())
