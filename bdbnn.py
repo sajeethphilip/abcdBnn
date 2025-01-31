@@ -217,10 +217,17 @@ def create_default_configs(input_path: str, args=None) -> Tuple[str, str]:
         dataset_props = handler.analyze_dataset(input_path)
         dataset_name = dataset_props['name']
 
-        # Define config paths
+        # Define config paths - ensure they're in data/<dataset_name> folder
         config_dir = Path('data') / dataset_name
-        cnn_config_path = config_dir / f"{dataset_name}.json"
+        config_dir.mkdir(parents=True, exist_ok=True)  # Create directory if it doesn't exist
+
+        cnn_config_path = config_dir / f"{dataset_name}.conf"
         dbnn_config_path = config_dir / "adaptive_dbnn.conf"
+
+        # Print paths for debugging
+        print(f"\nCreating configuration files:")
+        print(f"Dataset config path: {cnn_config_path}")
+        print(f"DBNN config path: {dbnn_config_path}")
 
         # Check if configs already exist
         if cnn_config_path.exists() and dbnn_config_path.exists():
@@ -231,7 +238,6 @@ def create_default_configs(input_path: str, args=None) -> Tuple[str, str]:
 
         # Create CNN config
         cnn_config = {
-            "_comment": "CNN configuration file",
             "dataset": {
                 "_comment": "Dataset configuration",
                 "name": dataset_name,
@@ -248,7 +254,20 @@ def create_default_configs(input_path: str, args=None) -> Tuple[str, str]:
             "model": {
                 "_comment": "Model architecture settings",
                 "feature_dims": args.feature_dims if args and args.feature_dims else 128,
-                "learning_rate": args.learning_rate if args and args.learning_rate else 0.001
+                "learning_rate": args.learning_rate if args and args.learning_rate else 0.001,
+                "optimizer": {
+                    "type": "Adam",
+                    "weight_decay": 1e-4,
+                    "momentum": 0.9,
+                    "beta1": 0.9,
+                    "beta2": 0.999,
+                    "epsilon": 1e-8
+                },
+                "scheduler": {
+                    "type": "StepLR",
+                    "step_size": 7,
+                    "gamma": 0.1
+                }
             },
             "training": {
                 "_comment": "Training parameters",
@@ -256,25 +275,53 @@ def create_default_configs(input_path: str, args=None) -> Tuple[str, str]:
                 "epochs": args.epochs if args and args.epochs else 20,
                 "num_workers": args.workers if args and args.workers else min(4, os.cpu_count() or 1),
                 "cnn_training": {
-                    "_comment": "CNN specific training settings",
                     "resume": True,
                     "fresh_start": args.fresh if args and args.fresh else False,
                     "min_loss_threshold": 0.01,
                     "checkpoint_dir": "Model/cnn_checkpoints"
+                },
+                "save_training_epochs": True,
+                "training_save_path": str(Path("training_data") / dataset_name)
+            },
+            "augmentation": {
+                "_comment": "Data augmentation settings",
+                "enable": True,
+                "random_resized_crop": {
+                    "enable": True,
+                    "size": dataset_props['input_size'],
+                    "scale": [0.08, 1.0],
+                    "ratio": [0.75, 1.33]
+                },
+                "random_horizontal_flip": {
+                    "enable": True,
+                    "p": 0.5
+                },
+                "color_jitter": {
+                    "enable": True,
+                    "brightness": 0.4,
+                    "contrast": 0.4,
+                    "saturation": 0.4,
+                    "hue": 0.1
+                },
+                "normalize": {
+                    "enable": True,
+                    "mean": dataset_props['mean'],
+                    "std": dataset_props['std']
                 }
             },
             "execution_flags": {
                 "_comment": "Execution control flags",
                 "mode": "train_and_predict",
-                "_comment_mode": "Options: train_and_predict, train_only, predict_only",
                 "use_gpu": args.use_gpu if args and hasattr(args, 'use_gpu') else torch.cuda.is_available(),
+                "mixed_precision": True,
+                "distributed_training": False,
+                "debug_mode": args.debug if args and args.debug else False,
                 "fresh_start": args.fresh if args and args.fresh else False
             }
         }
 
         # Create DBNN config
         dbnn_config = {
-            "_comment": "Configuration file for Adaptive DBNN training and execution",
             "training_params": {
                 "_comment": "Basic training parameters",
                 "trials": args.trials if args and args.trials else 100,
@@ -292,7 +339,21 @@ def create_default_configs(input_path: str, args=None) -> Tuple[str, str]:
                 "Save_training_epochs": True,
                 "training_save_path": str(Path("training_data") / dataset_name)
             },
-                'execution_flags': {
+            "likelihood_config": {
+                "_comment": "Likelihood computation settings",
+                "feature_group_size": 2,
+                "max_combinations": 1000,
+                "bin_sizes": [20]
+            },
+            "active_learning": {
+                "_comment": "Active learning parameters",
+                "tolerance": 1.0,
+                "cardinality_threshold_percentile": 95,
+                "strong_margin_threshold": 0.3,
+                "marginal_margin_threshold": 0.1,
+                "min_divergence": 0.1
+            },
+            "execution_flags": {
                 "_comment": "Execution control flags",
                 "train": True,
                 "train_only": False,
@@ -303,22 +364,34 @@ def create_default_configs(input_path: str, args=None) -> Tuple[str, str]:
             }
         }
 
-        # Save configurations
-        config_dir.mkdir(parents=True, exist_ok=True)
+        # Save configurations with proper error handling
+        try:
+            # Save CNN config
+            with open(cnn_config_path, 'w') as f:
+                json.dump(cnn_config, f, indent=4)
+                print(f"Created CNN configuration file: {cnn_config_path}")
 
-        with open(cnn_config_path, 'w') as f:
-            json.dump(cnn_config, f, indent=4)
+            # Save DBNN config
+            with open(dbnn_config_path, 'w') as f:
+                json.dump(dbnn_config, f, indent=4)
+                print(f"Created DBNN configuration file: {dbnn_config_path}")
 
-        with open(dbnn_config_path, 'w') as f:
-            json.dump(dbnn_config, f, indent=4)
-
-        print(f"Created configuration files in {config_dir}")
+        except Exception as e:
+            print(f"Error saving configuration files: {str(e)}")
+            # Clean up any partially created files
+            if os.path.exists(cnn_config_path):
+                os.remove(cnn_config_path)
+            if os.path.exists(dbnn_config_path):
+                os.remove(dbnn_config_path)
+            raise
 
         return str(cnn_config_path), str(dbnn_config_path)
 
     except Exception as e:
-        logging.error(f"Error creating configurations: {str(e)}", exc_info=True)
+        print(f"Error creating configurations: {str(e)}")
+        traceback.print_exc()
         raise
+
 def run_cdbnn_process(dataset_path: str, dataset_type: str, config_path: str = None, use_gpu: bool = True, debug: bool = False) -> bool:
     """Run CDBNN process with proper arguments
 
@@ -1901,6 +1974,14 @@ def main():
                     "Save_training_epochs": True,
                     "training_save_path": str(Path("training_data") / dataset_name),
                     "merge_datasets": merge_datasets
+                },
+                     "execution_flags": {
+                    "train": True,
+                    "train_only": False,
+                    "predict": True,
+                    "gen_samples": False,
+                    "fresh_start": False,
+                    "use_previous_model": True,
                 }
             }
 
