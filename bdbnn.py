@@ -1,5 +1,6 @@
 import os
 import sys
+import gc
 import json
 import logging
 import torch
@@ -22,8 +23,11 @@ import pickle
 import argparse
 import traceback
 import subprocess
+import psutil
 from itertools import combinations
-
+import torch.multiprocessing
+# Set sharing strategy at the start
+torch.multiprocessing.set_sharing_strategy('file_system')
 # Import the CDBNN and ADBNN modules
 from cdbnn import CNNTrainer, DatasetProcessor, ConfigManager
 from adbnn import DBNN, DatasetConfig,BinWeightUpdater
@@ -287,6 +291,15 @@ def create_default_configs(input_path: str, args=None) -> Tuple[str, str]:
                 "debug_enabled": args.debug if args and args.debug else False,
                 "Save_training_epochs": True,
                 "training_save_path": str(Path("training_data") / dataset_name)
+            },
+                'execution_flags': {
+                "_comment": "Execution control flags",
+                "train": True,
+                "train_only": False,
+                "predict": True,
+                "gen_samples": False,
+                "fresh_start": False,
+                "use_previous_model": True
             }
         }
 
@@ -1065,8 +1078,37 @@ def run_adbnn_process(dataset_name: str, config_path: str, use_gpu: bool = True,
 # Then modify the run_processing_pipeline function:
 def run_processing_pipeline(dataset_name: str, dataset_path: str, dataset_type: str,
                           cnn_config_path: str, dbnn_config_path: str, args):
-    """Run the complete processing pipeline"""
+    """Run the complete processing pipeline with proper cleanup"""
+    import gc
+    import os
+    import torch
+    import traceback
     try:
+        # Clean up before starting pipeline
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # Force close any lingering file handles
+        try:
+            import resource
+            import gc
+
+            # Force garbage collection
+            gc.collect()
+
+            # Get all open file descriptors
+            import psutil
+            process = psutil.Process()
+            for handler in process.open_files():
+                try:
+                    os.close(handler.fd)
+                except:
+                    pass
+
+        except ImportError:
+            pass  # psutil not available
+
         # Step 1: Run CDBNN processing
         print("\nStep 1: Running CDBNN processing...")
         if not run_cdbnn_process(
@@ -1077,6 +1119,11 @@ def run_processing_pipeline(dataset_name: str, dataset_path: str, dataset_type: 
             debug=getattr(args, 'debug', False)
         ):
             raise Exception("CDBNN processing failed")
+
+        # Clean up after CDBNN
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # Step 2: Run DBNN processing
         print("\nStep 2: Running DBNN processing...")
@@ -1096,6 +1143,23 @@ def run_processing_pipeline(dataset_name: str, dataset_path: str, dataset_type: 
         if getattr(args, 'debug', False):
             traceback.print_exc()
         return False
+    finally:
+        # Final cleanup
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # Close any remaining file handles
+        try:
+            import psutil
+            process = psutil.Process()
+            for handler in process.open_files():
+                try:
+                    os.close(handler.fd)
+                except:
+                    pass
+        except ImportError:
+            pass
 
 class DatasetHandler:
     """Handles dataset loading and property detection for various input types"""
@@ -1201,40 +1265,275 @@ class DatasetHandler:
 
         return data_root, dataset_name
 
-    def _analyze_image_properties(self, image_path: Path) -> Tuple[int, List[int]]:
+    def generate_default_config(self, folder_path: str) -> Dict:
         """
-        Analyze image to determine channels and size
+        Generate configuration files with proper cleanup
 
         Args:
-            image_path: Path to the image file
+            folder_path: Path to dataset folder
 
         Returns:
-            Tuple[int, List[int]]: (number of channels, [width, height])
+            Dict containing three configurations: json_config, dbnn_config, and data_config
         """
-        with Image.open(image_path) as img:
-            if img.mode == 'L':
-                channels = 1
-            elif img.mode == 'RGB':
-                channels = 3
-            elif img.mode == 'RGBA':
-                channels = 4
-            else:
-                channels = 1  # Default to grayscale
+        try:
+            # Normalize path and get dataset name
+            folder_path = os.path.abspath(folder_path)
+            dataset_name = os.path.basename(os.path.normpath(folder_path))
 
-            size = list(img.size)
-            return channels, size
+            # Find first image for properties detection
+            first_image = None
+            image_files = []
+            for root, _, files in os.walk(folder_path):
+                for f in files:
+                    if any(f.lower().endswith(ext) for ext in self.SUPPORTED_IMAGE_EXTENSIONS):
+                        image_files.append(os.path.join(root, f))
+                        if not first_image:
+                            first_image = os.path.join(root, f)
+                        break
+                if first_image:
+                    break
+
+            if not first_image:
+                raise ValueError(f"No valid images found in {folder_path}")
+
+            # Get image properties with proper cleanup
+            channels, input_size = self._analyze_image_properties(first_image)
+            mean, std = self._compute_dataset_stats(Path(folder_path), channels)
+
+            # Count classes from directory structure
+            train_dir = os.path.join(folder_path, 'train')
+            if os.path.exists(train_dir):
+                class_dirs = [d for d in os.listdir(train_dir) if os.path.isdir(os.path.join(train_dir, d))]
+            else:
+                class_dirs = [d for d in os.listdir(folder_path) if os.path.isdir(os.path.join(folder_path, d))]
+            num_classes = len(class_dirs)
+
+            if num_classes == 0:
+                raise ValueError(f"No class directories found in {folder_path}")
+
+            # 1. Generate main JSON config
+            json_config = {
+                "dataset": {
+                    "_comment": "Dataset configuration settings",
+                    "name": dataset_name,
+                    "_name_comment": "Dataset name",
+                    "type": "torchvision" if self.datatype.lower() == "torchvision" else "custom",
+                    "_type_comment": "custom or torchvision",
+                    "in_channels": channels,
+                    "_channels_comment": "Number of input channels",
+                    "num_classes": num_classes,
+                    "_classes_comment": "Number of classes",
+                    "input_size": list(input_size),
+                    "_size_comment": "Input image dimensions",
+                    "mean": mean,
+                    "_mean_comment": "Normalization mean",
+                    "std": std,
+                    "_std_comment": "Normalization standard deviation",
+                    "train_dir": train_dir,
+                    "_train_comment": "Training data directory",
+                    "test_dir": os.path.join(folder_path, 'test'),
+                    "_test_comment": "Test data directory"
+                },
+                "model": {
+                    "_comment": "Model configuration settings",
+                    "architecture": "CNN",
+                    "_arch_comment": "Model architecture type",
+                    "feature_dims": 128,
+                    "_dims_comment": "Feature dimensions",
+                    "learning_rate": 0.001,
+                    "_lr_comment": "Learning rate",
+                    "optimizer": {
+                        "type": "Adam",
+                        "_type_comment": "Optimizer type (Adam, SGD)",
+                        "weight_decay": 1e-4,
+                        "_decay_comment": "Weight decay for regularization",
+                        "momentum": 0.9,
+                        "_momentum_comment": "Momentum for SGD",
+                        "beta1": 0.9,
+                        "_beta1_comment": "Beta1 for Adam",
+                        "beta2": 0.999,
+                        "_beta2_comment": "Beta2 for Adam",
+                        "epsilon": 1e-8,
+                        "_epsilon_comment": "Epsilon for Adam"
+                    },
+                    "scheduler": {
+                        "type": "StepLR",
+                        "_type_comment": "Learning rate scheduler type",
+                        "step_size": 7,
+                        "_step_comment": "Step size for scheduler",
+                        "gamma": 0.1,
+                        "_gamma_comment": "Gamma for scheduler"
+                    }
+                },
+                "training": {
+                    "_comment": "Training parameters",
+                    "batch_size": 32,
+                    "_batch_comment": "Batch size for training",
+                    "epochs": 20,
+                    "_epoch_comment": "Number of epochs",
+                    "num_workers": min(4, os.cpu_count() or 1),
+                    "_workers_comment": "Number of worker processes",
+                    "cnn_training": {
+                        "resume": True,
+                        "_resume_comment": "Resume from checkpoint if available",
+                        "fresh_start": False,
+                        "_fresh_comment": "Start training from scratch",
+                        "min_loss_threshold": 0.01,
+                        "_threshold_comment": "Minimum loss threshold",
+                        "checkpoint_dir": "Model/cnn_checkpoints",
+                        "_checkpoint_comment": "Checkpoint directory"
+                    }
+                },
+                "execution_flags": {
+                    "_comment": "Execution control settings",
+                    "mode": "train_and_predict",
+                    "_mode_comment": "Execution mode options: train_and_predict, train_only, predict_only",
+                    "use_gpu": torch.cuda.is_available(),
+                    "_gpu_comment": "Whether to use GPU acceleration",
+                    "mixed_precision": True,
+                    "_precision_comment": "Whether to use mixed precision training",
+                    "distributed_training": False,
+                    "_distributed_comment": "Whether to use distributed training",
+                    "debug_mode": False,
+                    "_debug_comment": "Whether to enable debug mode",
+                    "use_previous_model": True,
+                    "_prev_model_comment": "Whether to use previously trained model",
+                    "fresh_start": False,
+                    "_fresh_comment": "Whether to start from scratch"
+                }
+            }
+
+            # 2. Generate DBNN config
+            dbnn_config = {
+                "training_params": {
+                    "_comment": "Basic training parameters",
+                    "trials": 100,
+                    "_trials_comment": "Number of trials",
+                    "cardinality_threshold": 0.9,
+                    "_card_thresh_comment": "Cardinality threshold",
+                    "cardinality_tolerance": 4,
+                    "_card_tol_comment": "Cardinality tolerance",
+                    "learning_rate": 0.1,
+                    "_lr_comment": "Learning rate",
+                    "random_seed": 42,
+                    "_seed_comment": "Random seed",
+                    "epochs": 1000,
+                    "_epochs_comment": "Maximum epochs",
+                    "test_fraction": 0.2,
+                    "_test_frac_comment": "Test data fraction",
+                    "enable_adaptive": True,
+                    "_adaptive_comment": "Enable adaptive learning",
+                    "modelType": "Histogram",
+                    "_model_comment": "Model type",
+                    "compute_device": "auto",
+                    "_device_comment": "Compute device",
+                    "use_interactive_kbd": False,
+                    "_kbd_comment": "Interactive keyboard",
+                    "debug_enabled": True,
+                    "_debug_comment": "Debug mode",
+                    "Save_training_epochs": True,
+                    "_save_comment": "Save training epochs",
+                    "training_save_path": f"training_data/{dataset_name}",
+                    "_save_path_comment": "Save path"
+                },
+                "execution_flags": {
+                    "train": True,
+                    "_train_comment": "Enable training",
+                    "train_only": False,
+                    "_train_only_comment": "Train only mode",
+                    "predict": True,
+                    "_predict_comment": "Enable prediction",
+                    "gen_samples": False,
+                    "_samples_comment": "Generate samples",
+                    "fresh_start": False,
+                    "_fresh_comment": "Fresh start",
+                    "use_previous_model": True,
+                    "_prev_model_comment": "Use previous model"
+                }
+            }
+
+            # 3. Generate data config
+            data_config = {
+                "file_path": f"{dataset_name}.csv",
+                "_path_comment": "Dataset file path",
+                "column_names": [f"feature_{i}" for i in range(128)] + ["target"],
+                "_columns_comment": "Column names",
+                "separator": ",",
+                "_separator_comment": "CSV separator",
+                "has_header": True,
+                "_header_comment": "Has header row",
+                "target_column": "target",
+                "_target_comment": "Target column",
+                "likelihood_config": {
+                    "feature_group_size": 2,
+                    "_group_comment": "Feature group size",
+                    "max_combinations": 1000,
+                    "_combinations_comment": "Max combinations",
+                    "bin_sizes": [20],
+                    "_bins_comment": "Histogram bin sizes"
+                },
+                "active_learning": {
+                    "tolerance": 1.0,
+                    "_tolerance_comment": "Learning tolerance",
+                    "cardinality_threshold_percentile": 95,
+                    "_percentile_comment": "Cardinality threshold",
+                    "strong_margin_threshold": 0.3,
+                    "_strong_comment": "Strong margin threshold",
+                    "marginal_margin_threshold": 0.1,
+                    "_marginal_comment": "Marginal margin threshold",
+                    "min_divergence": 0.1,
+                    "_divergence_comment": "Minimum divergence"
+                },
+                "training_params": {
+                    "Save_training_epochs": True,
+                    "_save_comment": "Save epoch data",
+                    "training_save_path": f"training_data/{dataset_name}",
+                    "_save_path_comment": "Save path"
+                },
+                "modelType": "Histogram",
+                "_model_comment": "Model type"
+            }
+
+            return {
+                "json_config": json_config,
+                "dbnn_config": dbnn_config,
+                "data_config": data_config
+            }
+
+        except Exception as e:
+            logger.error(f"Error generating configuration: {str(e)}")
+            raise
+
+        finally:
+            # Clean up image lists and force garbage collection
+            del image_files
+            gc.collect()
+
+            # Clear CUDA cache if available
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    def _analyze_image_properties(self, image_path: Path) -> Tuple[int, List[int]]:
+        """Analyze image to determine channels and size"""
+        try:
+            with Image.open(image_path) as img:
+                if img.mode == 'L':
+                    channels = 1
+                elif img.mode == 'RGB':
+                    channels = 3
+                elif img.mode == 'RGBA':
+                    channels = 4
+                else:
+                    channels = 1  # Default to grayscale
+
+                size = list(img.size)
+                return channels, size
+        except Exception as e:
+            logger.error(f"Error analyzing image {image_path}: {str(e)}")
+            raise
 
     def _compute_dataset_stats(self, data_root: Path, channels: int) -> Tuple[List[float], List[float]]:
-        """
-        Compute actual dataset mean and std
-
-        Args:
-            data_root: Root directory of the dataset
-            channels: Number of image channels
-
-        Returns:
-            Tuple[List[float], List[float]]: (mean per channel, std per channel)
-        """
+        """Compute dataset statistics with proper file cleanup"""
         image_files = []
         for ext in ['.jpg', '.jpeg', '.png', '.gif']:
             image_files.extend(data_root.rglob(f'*{ext}'))
@@ -1242,29 +1541,38 @@ class DatasetHandler:
         if not image_files:
             return [0.5] * channels, [0.5] * channels
 
-        # Sample up to 1000 images for statistics
         sample_size = min(1000, len(image_files))
         sampled_files = np.random.choice(image_files, sample_size, replace=False)
 
-        # Accumulate statistics
         means = []
         stds = []
 
         for img_path in sampled_files:
-            with Image.open(img_path) as img:
-                if img.mode != ('L' if channels == 1 else 'RGB'):
-                    img = img.convert('L' if channels == 1 else 'RGB')
-                img_array = np.array(img) / 255.0
-                if channels == 1:
-                    img_array = img_array[..., np.newaxis]
-                means.append(img_array.mean(axis=(0, 1)))
-                stds.append(img_array.std(axis=(0, 1)))
+            try:
+                with Image.open(img_path) as img:
+                    if img.mode != ('L' if channels == 1 else 'RGB'):
+                        img = img.convert('L' if channels == 1 else 'RGB')
+                    img_array = np.array(img) / 255.0
+                    if channels == 1:
+                        img_array = img_array[..., np.newaxis]
+                    means.append(img_array.mean(axis=(0, 1)))
+                    stds.append(img_array.std(axis=(0, 1)))
+                    del img_array  # Explicitly delete large arrays
+            except Exception as e:
+                logger.warning(f"Error processing {img_path}: {str(e)}")
+                continue
 
         # Compute overall statistics
         mean = np.mean(means, axis=0).tolist()
         std = np.mean(stds, axis=0).tolist()
 
+        # Cleanup
+        del means
+        del stds
+
         return mean, std
+
+
 
     def _get_torchvision_dataset(self, dataset_name: str) -> Dict:
         """
@@ -1481,6 +1789,8 @@ class DatasetHandler:
 
 
 
+
+
 def main():
     """Main execution function with dynamic dataset handling"""
     args = handle_command_line_args()
@@ -1521,13 +1831,13 @@ def main():
         # Check if we have both train and test directories and in Histogram mode
         merge_datasets = False
         if test_dir and (args.model_type == "Histogram" if args.model_type else True):
-            merge_default = 'y'  # Default to yes for Histogram mode
+            merge_default = 'y'
             merge_response = input(f"\nFound both train and test directories. Merge them for training? (Y/n) [default: {merge_default}]: ").strip().lower()
             merge_datasets = merge_response in ['', 'y', 'yes'] if merge_default == 'y' else merge_response in ['y', 'yes']
 
-        # Now generate configuration
+        # Generate configuration
         config_dict = processor.generate_default_config(os.path.dirname(train_dir))
-        config = config_dict["json_config"]  # This contains the proper structure
+        config = config_dict["json_config"]
 
         # Update config if merging datasets
         if merge_datasets:
@@ -1573,11 +1883,7 @@ def main():
 
             dataset_dir.mkdir(parents=True, exist_ok=True)
 
-            # Save CNN config
-            with open(cnn_config_path, 'w') as f:
-                json.dump(config, f, indent=4)
-
-            # Generate and save DBNN config
+            # Generate DBNN config
             dbnn_config = {
                 "training_params": {
                     "trials": args.trials if args and args.trials else 100,
@@ -1598,8 +1904,30 @@ def main():
                 }
             }
 
+            # Save configs using context managers
+            with open(cnn_config_path, 'w') as f:
+                json.dump(config, f, indent=4)
+
             with open(dbnn_config_path, 'w') as f:
                 json.dump(dbnn_config, f, indent=4)
+
+            # Allow configuration editing
+            if not args.no_interactive:
+                edit = input("\nWould you like to edit the configuration files? (y/n): ").lower() == 'y'
+                if edit:
+                    if os.name == 'nt':  # Windows
+                        os.system(f'notepad {cnn_config_path}')
+                        os.system(f'notepad {dbnn_config_path}')
+                    else:  # Unix-like
+                        editor = os.environ.get('EDITOR', 'nano')
+                        os.system(f'{editor} {cnn_config_path}')
+                        os.system(f'{editor} {dbnn_config_path}')
+
+                    # Re-read configs after editing
+                    with open(cnn_config_path, 'r') as f:
+                        config = json.load(f)
+                    with open(dbnn_config_path, 'r') as f:
+                        dbnn_config = json.load(f)
 
         except Exception as e:
             print(f"Error creating configurations: {str(e)}")
@@ -1607,23 +1935,11 @@ def main():
                 traceback.print_exc()
             return 1
 
-        # Allow configuration editing
-        if not args.no_interactive:
-            edit = input("\nWould you like to edit the configuration files? (y/n): ").lower() == 'y'
-            if edit:
-                if os.name == 'nt':  # Windows
-                    os.system(f'notepad {cnn_config_path}')
-                    os.system(f'notepad {dbnn_config_path}')
-                else:  # Unix-like
-                    editor = os.environ.get('EDITOR', 'nano')
-                    os.system(f'{editor} {cnn_config_path}')
-                    os.system(f'{editor} {dbnn_config_path}')
-
         # Run pipeline
         print("\nRunning processing pipeline...")
         success = run_processing_pipeline(
             dataset_name=dataset_name,
-            dataset_path=dataset_path,  # Use original dataset path
+            dataset_path=dataset_path,
             dataset_type=dataset_type,
             cnn_config_path=str(cnn_config_path),
             dbnn_config_path=str(dbnn_config_path),

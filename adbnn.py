@@ -1,5 +1,6 @@
 import torch
 import time
+from tqdm import tqdm
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
@@ -1877,12 +1878,10 @@ class DBNN(GPUDBNN):
         return final_selected_indices
 
     def adaptive_fit_predict(self, max_rounds: int = 10,
-                               improvement_threshold: float = 0.001,
-                               load_epoch: int = None,
-                               batch_size: int = 32):
-        """
-        Modified adaptive training strategy that handles previous training data correctly.
-        """
+                            improvement_threshold: float = 0.001,
+                            load_epoch: int = None,
+                            batch_size: int = 32):
+        """Modified adaptive training strategy with proper fresh start handling"""
         DEBUG.log(" Starting adaptive_fit_predict")
         if not EnableAdaptive:
             print("Adaptive learning is disabled. Using standard training.")
@@ -1911,11 +1910,13 @@ class DBNN(GPUDBNN):
             self.y_tensor = torch.LongTensor(y_encoded).to(self.device)
 
             # Handle model state based on flags
+            model_loaded = False
             if self.use_previous_model:
                 print("Loading previous model state")
                 if self._load_model_components():
                     self._load_best_weights()
                     self._load_categorical_encoders()
+                    model_loaded = True
 
                     if not self.fresh_start:
                         # Load previous training data
@@ -1944,51 +1945,28 @@ class DBNN(GPUDBNN):
                             # Initialize test indices as all indices not in training
                             test_indices = list(set(range(len(X))) - set(train_indices))
                         else:
-                            print("No previous training data found")
+                            print("No previous training data found - starting fresh")
                             train_indices = []
                             test_indices = list(range(len(X)))
-                    else:
-                        print("Fresh start with existing model - all data will start in test set")
-                        train_indices = []
-                        test_indices = list(range(len(X)))
                 else:
                     print("No previous model found - starting fresh")
-                    self._clean_existing_model()
-                    train_indices = []
-                    test_indices = list(range(len(X)))
-            else:
-                if self.fresh_start:
-                    print("Starting with fresh model")
-                    self._clean_existing_model()
+
+            if not model_loaded:
+                print("Initializing fresh model")
+                self._clean_existing_model()
                 train_indices = []
                 test_indices = list(range(len(X)))
+
+                # Initialize feature pairs for fresh start
+                self.feature_pairs = self._generate_feature_combinations(
+                    self.X_tensor.shape[1],
+                    self.config.get('likelihood_config', {}).get('feature_group_size', 2),
+                    self.config.get('likelihood_config', {}).get('max_combinations', None)
+                )
 
             # Initialize test indices if still None
             if test_indices is None:
                 test_indices = list(range(len(X)))
-
-            # Initialize likelihood parameters if needed
-            if self.likelihood_params is None:
-                DEBUG.log(" Initializing likelihood parameters")
-                if self.model_type == "Histogram":
-                    self.likelihood_params = self._compute_pairwise_likelihood_parallel(
-                        self.X_tensor, self.y_tensor, self.X_tensor.shape[1]
-                    )
-                elif self.model_type == "Gaussian":
-                    self.likelihood_params = self._compute_pairwise_likelihood_parallel_std(
-                        self.X_tensor, self.y_tensor, self.X_tensor.shape[1]
-                    )
-                DEBUG.log(" Likelihood parameters computed")
-
-            # Before initializing weights, get unique classes from either loaded components or data
-            if hasattr(self, 'label_encoder') and hasattr(self.label_encoder, 'classes_'):
-                # Get classes from loaded label encoder
-                unique_classes = self.label_encoder.classes_
-            else:
-                # Get classes from target data
-                unique_classes = pd.unique(self.data[self.target_column])
-                # Fit label encoder if needed
-                self.label_encoder.fit(unique_classes)
 
             # Initialize likelihood parameters if needed
             if self.likelihood_params is None:
@@ -2012,7 +1990,7 @@ class DBNN(GPUDBNN):
             # Initialize model weights if needed
             if self.current_W is None:
                 DEBUG.log(" Initializing model weights")
-                n_classes = len(unique_classes)
+                n_classes = len(self.label_encoder.classes_)
                 n_pairs = len(self.feature_pairs) if self.feature_pairs is not None else 0
                 if n_pairs == 0:
                     raise ValueError("Feature pairs not initialized")
@@ -2027,13 +2005,15 @@ class DBNN(GPUDBNN):
 
             # Initialize training set if empty
             if len(train_indices) == 0:
+                print("Initializing new training set with minimum samples")
                 # Select minimum samples from each class for initial training
+                unique_classes = self.label_encoder.classes_
                 for class_label in unique_classes:
-                    class_indices = np.where(y_encoded == class_label)[0]
+                    class_indices = np.where(y_encoded == self.label_encoder.transform([class_label])[0])[0]
                     if len(class_indices) < 2:
-                        selected_indices = class_indices  # Take all available if less than 2
+                        selected_indices = class_indices
                     else:
-                        selected_indices = class_indices[:2]  # Take 2 samples from each class
+                        selected_indices = class_indices[:2]
                     train_indices.extend(selected_indices)
 
                 # Update test indices
@@ -2042,14 +2022,7 @@ class DBNN(GPUDBNN):
             DEBUG.log(f" Initial training set size: {len(train_indices)}")
             DEBUG.log(f" Initial test set size: {len(test_indices)}")
 
-            # Initialize adaptive learning patience tracking
-            adaptive_patience = 5  # Number of rounds to wait for improvement
-            adaptive_patience_counter = 0
-            best_overall_accuracy = 0
-            best_train_accuracy = 0
-            best_test_accuracy = 0
-
-            # Training loop
+            # Continue with training loop...
             for round_num in range(max_rounds):
                 print(f"\nRound {round_num + 1}/{max_rounds}")
                 print(f"Training set size: {len(train_indices)}")
@@ -2078,23 +2051,30 @@ class DBNN(GPUDBNN):
 
                 # Check if we're improving overall
                 improved = False
-                if train_accuracy > best_train_accuracy + improvement_threshold:
+                if 'best_train_accuracy' not in locals():
+                    best_train_accuracy = train_accuracy
+                    improved = True
+                elif train_accuracy > best_train_accuracy + improvement_threshold:
                     best_train_accuracy = train_accuracy
                     improved = True
                     print(f"Improved training accuracy to {train_accuracy:.4f}")
 
-                if test_accuracy > best_test_accuracy + improvement_threshold:
+                if 'best_test_accuracy' not in locals():
+                    best_test_accuracy = test_accuracy
+                    improved = True
+                elif test_accuracy > best_test_accuracy + improvement_threshold:
                     best_test_accuracy = test_accuracy
                     improved = True
                     print(f"Improved test accuracy to {test_accuracy:.4f}")
 
+                # Reset adaptive patience if improved
                 if improved:
                     adaptive_patience_counter = 0
                 else:
                     adaptive_patience_counter += 1
-                    print(f"No significant overall improvement. Adaptive patience: {adaptive_patience_counter}/{adaptive_patience}")
-                    if adaptive_patience_counter >= adaptive_patience:
-                        print(f"No improvement in accuracy after {adaptive_patience} rounds of adding samples.")
+                    print(f"No significant overall improvement. Adaptive patience: {adaptive_patience_counter}/5")
+                    if adaptive_patience_counter >= 5:  # Using fixed value of 5 for adaptive patience
+                        print(f"No improvement in accuracy after 5 rounds of adding samples.")
                         print(f"Best training accuracy achieved: {best_train_accuracy:.4f}")
                         print(f"Best test accuracy achieved: {best_test_accuracy:.4f}")
                         print("Stopping adaptive training.")
@@ -2115,6 +2095,7 @@ class DBNN(GPUDBNN):
                 # Reset the metrics printed flag
                 self._last_metrics_printed = False
 
+                # Check if we've achieved perfect accuracy
                 if train_accuracy == 1.0:
                     if len(test_indices) == 0:
                         print("No more test samples available. Training complete.")
@@ -2279,22 +2260,24 @@ class DBNN(GPUDBNN):
             DEBUG.log(" Training mode preprocessing")
             self.original_columns = X.columns.tolist()
 
-            # Calculate cardinality threshold
-            cardinality_threshold = self._calculate_cardinality_threshold()
-            DEBUG.log(f" Cardinality threshold: {cardinality_threshold}")
+            with tqdm(total=4, desc="Preprocessing steps") as pbar:
 
-            # Remove high cardinality columns
-            X = self._remove_high_cardinality_columns(X, cardinality_threshold)
-            DEBUG.log(f" Shape after cardinality filtering: {X.shape}")
+                # Calculate cardinality threshold
+                cardinality_threshold = self._calculate_cardinality_threshold()
+                DEBUG.log(f" Cardinality threshold: {cardinality_threshold}")
 
-            # Store the features we'll actually use
-            self.feature_columns = X.columns.tolist()
-            DEBUG.log(f" Selected feature columns: {self.feature_columns}")
+                # Remove high cardinality columns
+                X = self._remove_high_cardinality_columns(X, cardinality_threshold)
+                DEBUG.log(f" Shape after cardinality filtering: {X.shape}")
 
-            # Store high cardinality columns for future reference
-            self.high_cardinality_columns = list(set(self.original_columns) - set(self.feature_columns))
-            if self.high_cardinality_columns:
-                DEBUG.log(f" Removed high cardinality columns: {self.high_cardinality_columns}")
+                # Store the features we'll actually use
+                self.feature_columns = X.columns.tolist()
+                DEBUG.log(f" Selected feature columns: {self.feature_columns}")
+
+                # Store high cardinality columns for future reference
+                self.high_cardinality_columns = list(set(self.original_columns) - set(self.feature_columns))
+                if self.high_cardinality_columns:
+                    DEBUG.log(f" Removed high cardinality columns: {self.high_cardinality_columns}")
         else:
             DEBUG.log(" Prediction mode preprocessing")
             if not hasattr(self, 'feature_columns'):
@@ -2318,36 +2301,40 @@ class DBNN(GPUDBNN):
             if hasattr(self, 'high_cardinality_columns'):
                 X = X.drop(columns=self.high_cardinality_columns, errors='ignore')
 
-        # Handle categorical features
-        DEBUG.log(" Starting categorical encoding")
-        try:
-            X_encoded = self._encode_categorical_features(X, is_training)
-            DEBUG.log(f" Shape after categorical encoding: {X_encoded.shape}")
-            DEBUG.log(f" Encoded dtypes:\n{X_encoded.dtypes}")
-        except Exception as e:
-            DEBUG.log(f" Error in categorical encoding: {str(e)}")
-            raise
+        print("Preprocessing prediction data...")
+        with tqdm(total=2, desc="Preprocessing steps") as pbar:
 
-        # Convert to numpy and check for issues
-        try:
-            X_numpy = X_encoded.to_numpy()
-            DEBUG.log(f" Numpy array shape: {X_numpy.shape}")
-            DEBUG.log(f" Any NaN: {np.isnan(X_numpy).any()}")
-            DEBUG.log(f" Any Inf: {np.isinf(X_numpy).any()}")
-        except Exception as e:
-            DEBUG.log(f" Error converting to numpy: {str(e)}")
-            raise
+            # Handle categorical features
+            DEBUG.log(" Starting categorical encoding")
+            try:
+                X_encoded = self._encode_categorical_features(X, is_training)
+                DEBUG.log(f" Shape after categorical encoding: {X_encoded.shape}")
+                DEBUG.log(f" Encoded dtypes:\n{X_encoded.dtypes}")
+            except Exception as e:
+                DEBUG.log(f" Error in categorical encoding: {str(e)}")
+                raise
 
-        # Scale the features
-        try:
-            if is_training:
-                X_scaled = self.scaler.fit_transform(X_numpy)
-            else:
-                X_scaled = self.scaler.transform(X_numpy)
+            # Convert to numpy and check for issues
+            try:
+                X_numpy = X_encoded.to_numpy()
+                DEBUG.log(f" Numpy array shape: {X_numpy.shape}")
+                DEBUG.log(f" Any NaN: {np.isnan(X_numpy).any()}")
+                DEBUG.log(f" Any Inf: {np.isinf(X_numpy).any()}")
+            except Exception as e:
+                DEBUG.log(f" Error converting to numpy: {str(e)}")
+                raise
 
-            DEBUG.log(f" Scaling successful")
-        except Exception as e:
-            DEBUG.log(f" Standard scaling failed: {str(e)}. Using manual scaling")
+            # Scale the features
+            try:
+                if is_training:
+                    X_scaled = self.scaler.fit_transform(X_numpy)
+                else:
+                    X_scaled = self.scaler.transform(X_numpy)
+
+                DEBUG.log(f" Scaling successful")
+            except Exception as e:
+                DEBUG.log(f" Standard scaling failed: {str(e)}. Using manual scaling")
+            pbar.update(1)
             if X_numpy.size == 0:
                 print("[WARNING] Empty feature array! Returning original data")
                 X_scaled = X_numpy
@@ -2358,6 +2345,7 @@ class DBNN(GPUDBNN):
                 X_scaled = (X_numpy - means) / stds
 
         DEBUG.log(f" Final preprocessed shape: {X_scaled.shape}")
+        pbar.close()
         return torch.FloatTensor(X_scaled)
 
     def _generate_feature_combinations(self, n_features: int, group_size: int, max_combinations: int = None) -> torch.Tensor:
@@ -2404,10 +2392,14 @@ class DBNN(GPUDBNN):
     def _compute_pairwise_likelihood_parallel(self, dataset: torch.Tensor, labels: torch.Tensor, feature_dims: int):
         """Optimized non-parametric likelihood computation with configurable bin sizes"""
         DEBUG.log(" Starting _compute_pairwise_likelihood_parallel")
-
+        print("\nComputing pairwise likelihoods...")
         # Input validation and preparation
         dataset = torch.as_tensor(dataset, device=self.device).contiguous()
         labels = torch.as_tensor(labels, device=self.device).contiguous()
+
+        # Initialize progress tracking
+        n_pairs = len(self.feature_pairs)
+        pair_pbar = tqdm(total=n_pairs, desc="Processing feature pairs")
 
         # Pre-compute unique classes once
         unique_classes, class_counts = torch.unique(labels, return_counts=True)
@@ -2463,7 +2455,7 @@ class DBNN(GPUDBNN):
                 ).contiguous()
                 bin_edges.append(edges)
                 DEBUG.log(f" Dimension {dim} edges range: {edges[0].item():.3f} to {edges[-1].item():.3f}")
-
+            pair_pbar.update(1)
             # Initialize bin counts with appropriate shape for variable bin sizes
             bin_shape = [n_classes] + [size for size in group_bin_sizes]
             bin_counts = torch.zeros(bin_shape, device=self.device, dtype=torch.float32)
@@ -2501,7 +2493,7 @@ class DBNN(GPUDBNN):
 
             DEBUG.log(f" Bin counts shape: {smoothed_counts.shape}")
             DEBUG.log(f" Bin probs shape: {bin_probs.shape}")
-
+        pair_pbar.close()
         return {
             'bin_edges': all_bin_edges,
             'bin_counts': all_bin_counts,
@@ -2915,8 +2907,10 @@ class DBNN(GPUDBNN):
     def predict(self, X: torch.Tensor, batch_size: int = 32):
         """Make predictions in batches using the best model weights"""
         # Store current weights temporarily
+        print("\nMaking predictions...")
         temp_W = self.current_W
-
+        n_batches = (len(X) + batch_size - 1) // batch_size
+        pred_pbar = tqdm(total=n_batches, desc="Prediction batches")
         # Use best weights for prediction
         self.current_W = self.best_W.clone() if self.best_W is not None else self.current_W
 
@@ -2937,11 +2931,13 @@ class DBNN(GPUDBNN):
 
                 batch_predictions = torch.argmax(posteriors, dim=1)
                 predictions.append(batch_predictions)
+                pred_pbar.update(1)
 
         finally:
             # Restore current weights
             self.current_W = temp_W
 
+        pred_pbar.close()
         return torch.cat(predictions).cpu()
 
 
@@ -3137,88 +3133,33 @@ class DBNN(GPUDBNN):
         except Exception as e:
             print(f"Warning: Could not save confusion matrix plot: {str(e)}")
     def train(self, X_train: torch.Tensor, y_train: torch.Tensor, X_test: torch.Tensor, y_test: torch.Tensor, batch_size: int = 32):
-        """
-        Training loop with proper error tracking and GPU data transfer handling.
-        """
+        """Training loop with progress bars and proper metric calculation timing"""
+        print("\nStarting training...")
 
-        # Store tensors as class attributes for access during training
-        self.X_train_tensor = X_train
-        self.y_train_tensor = y_train
-        self.X_test_tensor = X_test
-        self.y_test_tensor = y_test
+        # Initialize progress bar for epochs
+        epoch_pbar = tqdm(total=self.max_epochs, desc="Training epochs")
 
-
-        # Handle data transfer to GPU correctly
-        if self.device != 'cpu':
-            if not X_train.is_cuda:
-                X_train = torch.as_tensor(X_train).pin_memory().to(self.device, non_blocking=True)
-                y_train = torch.as_tensor(y_train).pin_memory().to(self.device, non_blocking=True)
-                X_test = torch.as_tensor(X_test).pin_memory().to(self.device, non_blocking=True)
-                y_test = torch.as_tensor(y_test).pin_memory().to(self.device, non_blocking=True)
-        else:
-            X_train = torch.as_tensor(X_train).to(self.device)
-            y_train = torch.as_tensor(y_train).to(self.device)
-            X_test = torch.as_tensor(X_test).to(self.device)
-            y_test = torch.as_tensor(y_test).to(self.device)
-
-        # Initialize bin-specific weights if not loaded
-        if self.weight_updater is None:
-            self._initialize_bin_weights()
-
-        # Load previous best error if exists
-        previous_best_error = float('inf')
-        if hasattr(self, 'best_error'):
-            previous_best_error = self.best_error
-
-        # Pre-compute likelihood parameters
-        if self.model_type == "Histogram":
-            self.likelihood_params = self._compute_pairwise_likelihood_parallel(
-                X_train, y_train, X_train.shape[1]
-            )
-        elif self.model_type == "Gaussian":
-            self.likelihood_params = self._compute_pairwise_likelihood_parallel_std(
-                X_train, y_train, X_train.shape[1]
-            )
-
-        # Initialize weights if not loaded
-        if self.current_W is None:
-            n_pairs = len(self.feature_pairs)
-            n_classes = len(self.likelihood_params['classes'])
-            self.current_W = torch.full(
-                (n_classes, n_pairs),
-                0.1,
-                device=self.device,
-                dtype=torch.float32
-            )
-            if self.best_W is None:
-                self.best_W = self.current_W.clone()
-
-        # Training loop variables
+        # Pre-allocate tensors for batch processing
         n_samples = len(X_train)
+        predictions = torch.empty(batch_size, dtype=torch.long, device=self.device)
+        batch_mask = torch.empty(batch_size, dtype=torch.bool, device=self.device)
+
+        # Initialize tracking variables
         error_rates = []
         train_losses = []
         test_losses = []
         train_accuracies = []
         test_accuracies = []
-        stop_training = False
-        patience_counter = 0
-        self.learning_rate = LearningRate
-
-        # Initialize previous values for color comparison
         prev_train_error = float('inf')
         prev_test_accuracy = 0.0
+        patience_counter = 0
 
         if self.in_adaptive_fit:
             patience = 5
         else:
             patience = Trials
 
-        # Pre-allocate tensors for batch processing
-        predictions = torch.empty(batch_size, dtype=torch.long, device=self.device)
-        batch_mask = torch.empty(batch_size, dtype=torch.bool, device=self.device)
-
         for epoch in range(self.max_epochs):
-
             # Save epoch data
             self.save_epoch_data(epoch, self.train_indices, self.test_indices)
 
@@ -3227,6 +3168,9 @@ class DBNN(GPUDBNN):
             n_errors = 0
 
             # Process training data in batches
+            n_batches = (len(X_train) + batch_size - 1) // batch_size
+            batch_pbar = tqdm(total=n_batches, desc=f"Epoch {epoch+1} batches", leave=False)
+
             for i in range(0, n_samples, batch_size):
                 batch_end = min(i + batch_size, n_samples)
                 current_batch_size = batch_end - i
@@ -3253,20 +3197,32 @@ class DBNN(GPUDBNN):
                             batch_y[idx].item(),
                             posteriors[idx].cpu().numpy()
                         ))
+                batch_pbar.update(1)
+
+            batch_pbar.close()
 
             # Calculate training error rate
             train_error_rate = n_errors / n_samples
             error_rates.append(train_error_rate)
 
- # Calculate test accuracy on all remaining test data
+            # Calculate test accuracy
             if hasattr(self, 'test_indices') and self.test_indices:
-                full_test_data = self.X_tensor[self.test_indices]  # Use class attribute
-                full_test_labels = self.y_tensor[self.test_indices]  # Use class attribute
+                full_test_data = self.X_tensor[self.test_indices]
+                full_test_labels = self.y_tensor[self.test_indices]
                 test_predictions = self.predict(full_test_data, batch_size=batch_size)
                 test_accuracy = (test_predictions == full_test_labels.cpu()).float().mean()
             else:
                 test_predictions = self.predict(X_test, batch_size=batch_size)
                 test_accuracy = (test_predictions == y_test.cpu()).float().mean()
+
+            # Update epoch progress with newly calculated metrics
+            epoch_pbar.update(1)
+            epoch_pbar.set_postfix({
+                'train_error': f"{train_error_rate:.4f}",
+                'test_acc': f"{test_accuracy:.4f}"
+            })
+
+            # Calculate training time
             Trend_time = time.time()
             training_time = Trend_time - Trstart_time
 
@@ -3274,14 +3230,12 @@ class DBNN(GPUDBNN):
             print(f"Epoch {epoch + 1}: Train error rate = {Colors.color_value(train_error_rate, prev_train_error, False)}, "
                   f"Test accuracy = {Colors.color_value(test_accuracy, prev_test_accuracy, True)}")
 
-
-
             # Update previous values for next iteration
             prev_train_error = train_error_rate
             prev_test_accuracy = test_accuracy
 
-            # Check for convergence on test data
-            if test_accuracy == 1.0 or train_error_rate==0:
+            # Check for convergence
+            if test_accuracy == 1.0 or train_error_rate == 0:
                 print(f"Moving on to Epoch: {epoch + 1}")
                 break
 
@@ -3309,10 +3263,8 @@ class DBNN(GPUDBNN):
             train_loss = n_errors / n_samples
             train_pred = self.predict(X_train, batch_size)
             train_acc = (train_pred == y_train.cpu()).float().mean()
-
             test_loss = (test_predictions != y_test.cpu()).float().mean()
 
-            # Store metrics
             train_losses.append(train_loss)
             test_losses.append(test_loss)
             train_accuracies.append(train_acc)
@@ -3325,8 +3277,10 @@ class DBNN(GPUDBNN):
                 save_path=f'{self.dataset_name}_training_metrics.png'
             )
 
+        epoch_pbar.close()
         self._save_model_components()
         return self.current_W.cpu(), error_rates
+
 
     def plot_training_metrics(self, train_loss, test_loss, train_acc, test_acc, save_path=None):
         """Plot training and testing metrics over epochs"""
@@ -4234,43 +4188,101 @@ from typing import List, Tuple
 import pandas as pd
 from datetime import datetime
 
-def find_dataset_pairs() -> List[Tuple[str, str, str]]:
+def find_dataset_pairs(data_dir: str = 'data') -> List[Tuple[str, str, str]]:
     """
-    Find all matching .conf and .csv files following cdbnn folder structure:
-    - Config files are in data/
-    - CSV files are in data/<dataset_name>/
+    Recursively find all matching .conf and .csv files in the data directory structure.
+
+    Args:
+        data_dir: Root directory to search for datasets
 
     Returns:
         List of tuples (basename, conf_path, csv_path)
     """
     # Ensure data directory exists
-    data_dir = 'data'
     if not os.path.exists(data_dir):
-        print(f"\nNo 'data' directory found. Creating one...")
+        print(f"\nNo '{data_dir}' directory found. Creating one...")
         os.makedirs(data_dir)
         return []
 
-    # Get all conf files from data directory except adaptive_dbnn.conf
-    conf_files = [f for f in glob.glob(os.path.join(data_dir, "*.conf"))
-                 if os.path.basename(f) != "adaptive_dbnn.conf"]
     dataset_pairs = []
+    processed_datasets = set()
 
-    # Check each conf file for matching csv in dataset-specific folder
-    for conf_file in conf_files:
-        basename = os.path.splitext(os.path.basename(conf_file))[0]
-        dataset_dir = os.path.join(data_dir, basename)
+    # Load adaptive_dbnn.conf if it exists
+    adaptive_conf = {}
+    adaptive_conf_path = 'adaptive_dbnn.conf'
+    if os.path.exists(adaptive_conf_path):
+        try:
+            with open(adaptive_conf_path, 'r') as f:
+                adaptive_conf = json.load(f)
+            print(f"Loaded adaptive configuration from {adaptive_conf_path}")
+        except Exception as e:
+            print(f"Warning: Could not load adaptive configuration: {str(e)}")
+    else:
+        print("No adaptive_dbnn.conf found in working directory")
 
-        # Look for CSV file in dataset directory
-        csv_file = os.path.join(dataset_dir, f"{basename}.csv")
+    # Walk through all subdirectories
+    for root, dirs, files in os.walk(data_dir):
+        # Process configuration files
+        conf_files = [f for f in files if f.endswith('.conf') and f != 'adaptive_dbnn.conf']
 
-        if os.path.exists(csv_file):
-            dataset_pairs.append((basename, conf_file, csv_file))
-            print(f"Found dataset pair:")
-            print(f"  Config: {conf_file}")
-            print(f"  Data  : {csv_file}")
-        else:
-            print(f"\nWarning: Config file {conf_file} exists but no matching CSV found in {dataset_dir}")
-            print(f"Expected CSV path: {csv_file}")
+        for conf_file in conf_files:
+            basename = os.path.splitext(conf_file)[0]
+            if basename in processed_datasets:
+                continue
+
+            conf_path = os.path.join(root, conf_file)
+
+            # Look for matching CSV in same directory and dataset-specific subdirectory
+            csv_file = f"{basename}.csv"
+            csv_paths = [
+                os.path.join(root, csv_file),
+                os.path.join(root, basename, csv_file)
+            ]
+
+            csv_path = None
+            for path in csv_paths:
+                if os.path.exists(path):
+                    csv_path = path
+                    break
+
+            if csv_path:
+                # Update configuration with adaptive settings if available
+                if adaptive_conf:
+                    try:
+                        with open(conf_path, 'r') as f:
+                            dataset_conf = json.load(f)
+
+                        # Update execution flags from adaptive configuration
+                        if 'execution_flags' in adaptive_conf:
+                            dataset_conf['execution_flags'] = adaptive_conf['execution_flags']
+
+                        # Update training parameters
+                        if 'training_params' in adaptive_conf:
+                            dataset_conf['training_params'].update(adaptive_conf['training_params'])
+
+                        # Save updated configuration
+                        with open(conf_path, 'w') as f:
+                            json.dump(dataset_conf, f, indent=4)
+                        print(f"Updated configuration for {basename} with adaptive settings")
+
+                    except Exception as e:
+                        print(f"Warning: Could not update configuration for {basename}: {str(e)}")
+
+                dataset_pairs.append((basename, conf_path, csv_path))
+                processed_datasets.add(basename)
+                print(f"\nFound dataset pair:")
+                print(f"  Config: {conf_path}")
+                print(f"  Data  : {csv_path}")
+            else:
+                print(f"\nWarning: Config file {conf_file} exists but no matching CSV found")
+                print(f"Looked in:")
+                for path in csv_paths:
+                    print(f"  - {path}")
+
+    if not dataset_pairs:
+        print("\nNo matching .conf and .csv file pairs found.")
+        print("Each dataset should have both a .conf configuration file and a matching .csv data file.")
+        print("Example: 'dataset1.conf' and 'dataset1.csv'")
 
     return dataset_pairs
 
@@ -4377,14 +4389,11 @@ def validate_config(conf_path: str) -> bool:
         return False
 
 def print_dataset_info(conf_path: str, csv_path: str):
-    """Print information about the dataset"""
+    """Print information about the dataset with robust error handling"""
     try:
         # Load configuration
         with open(conf_path, 'r') as f:
             config = json.load(f)
-
-        # Load CSV header
-        df = pd.read_csv(csv_path, nrows=0)
 
         # Get file sizes
         conf_size = os.path.getsize(conf_path)
@@ -4395,24 +4404,48 @@ def print_dataset_info(conf_path: str, csv_path: str):
         print(f"Configuration file: {conf_path} ({conf_size/1024:.1f} KB)")
         print(f"Data file: {csv_path} ({csv_size/1024:.1f} KB)")
         print(f"Model type: {config.get('modelType', 'Not specified')}")
-        print(f"Target column: {config['target_column']}")
-        print(f"Number of columns: {len(config['column_names'])}")
 
-        # Count excluded features
-        excluded = sum(1 for col in config['column_names'] if col.startswith('#'))
-        print(f"Excluded features: {excluded}")
+        # Safely access configuration values
+        target_column = config.get('target_column', 'target')  # Default to 'target' if not specified
+        print(f"Target column: {target_column}")
 
-        # Show first few column names
-        print("\nFeatures:")
-        for col in config['column_names'][:5]:
-            excluded = "  (excluded)" if col.startswith('#') else ""
-            print(f"  {col}{excluded}")
-        if len(config['column_names']) > 5:
-            print(f"  ... and {len(config['column_names'])-5} more")
+        # Safely handle column names
+        column_names = config.get('column_names', [])
+        if column_names:
+            print(f"Number of columns: {len(column_names)}")
 
+            # Count excluded features
+            excluded = sum(1 for col in column_names if str(col).startswith('#'))
+            print(f"Excluded features: {excluded}")
+
+            # Show first few column names
+            print("\nFeatures:")
+            for col in column_names[:5]:
+                excluded = "  (excluded)" if str(col).startswith('#') else ""
+                print(f"  {col}{excluded}")
+            if len(column_names) > 5:
+                print(f"  ... and {len(column_names)-5} more")
+        else:
+            # Try to get column info from CSV if no column names in config
+            try:
+                df = pd.read_csv(csv_path, nrows=0)
+                columns = df.columns.tolist()
+                print(f"Number of columns (from CSV): {len(columns)}")
+                print("\nFeatures (from CSV):")
+                for col in columns[:5]:
+                    print(f"  {col}")
+                if len(columns) > 5:
+                    print(f"  ... and {len(columns)-5} more")
+            except Exception as e:
+                print("Could not read column information from CSV")
+
+    except FileNotFoundError:
+        print(f"Error: Could not find configuration file: {conf_path}")
+    except json.JSONDecodeError:
+        print(f"Error: Invalid JSON in configuration file: {conf_path}")
     except Exception as e:
         print(f"Error reading dataset info: {str(e)}")
-
+        print(f"Traceback: {traceback.format_exc()}")
 
 if __name__ == "__main__":
     print("DBNN Dataset Processor")

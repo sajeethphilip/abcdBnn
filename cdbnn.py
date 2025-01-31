@@ -1,6 +1,10 @@
 import torch
 import copy
 import sys
+import gc
+import os
+import torch
+import traceback
 import  argparse
 import torch.nn as nn
 import torch.optim as optim
@@ -33,7 +37,9 @@ from tqdm import tqdm
 from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
 from pathlib import Path
-
+import torch.multiprocessing
+# Set sharing strategy at the start
+torch.multiprocessing.set_sharing_strategy('file_system')
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -1217,60 +1223,6 @@ class CNNFeatureExtractor:
 
         return history
 
-def _train_epoch(self, train_loader: DataLoader, epoch: int) -> Tuple[float, float]:
-    self.feature_extractor.train()
-    running_loss = 0.0
-    correct = 0
-    total = 0
-
-    # Create progress bar with detailed metrics
-    batch_pbar = tqdm(train_loader,
-                     desc=f'Epoch {epoch+1}',
-                     unit='batch',
-                     bar_format='{l_bar}{bar:20}{r_bar}{bar:-20b}',
-                     dynamic_ncols=True)
-
-    for batch_idx, (inputs, targets) in enumerate(batch_pbar):
-        # [Existing training code...]
-
-        # Update progress bar
-        batch_loss = running_loss / (batch_idx + 1)
-        batch_acc = 100. * correct / total
-        batch_pbar.set_postfix({
-            'loss': f'{batch_loss:.4f}',
-            'acc': f'{batch_acc:.2f}%'
-        })
-
-    batch_pbar.close()
-    return epoch_loss, epoch_acc
-
-    def _validate(self, val_loader: DataLoader) -> Tuple[float, float]:
-        self.feature_extractor.eval()
-        running_loss = 0.0
-        correct = 0
-        total = 0
-
-        val_pbar = tqdm(val_loader,
-                       desc='Validation',
-                       unit='batch',
-                       bar_format='{l_bar}{bar:20}{r_bar}{bar:-20b}',
-                       dynamic_ncols=True)
-
-        with torch.no_grad():
-            for inputs, targets in val_pbar:
-                # [Existing validation code...]
-
-                # Update validation progress bar
-                val_loss = running_loss / len(val_loader)
-                val_acc = 100. * correct / total
-                val_pbar.set_postfix({
-                    'loss': f'{val_loss:.4f}',
-                    'acc': f'{val_acc:.2f}%'
-                })
-
-        val_pbar.close()
-        return running_loss / len(val_loader), 100. * correct / total
-
 
     def _get_triplet_samples(self, features: torch.Tensor, labels: torch.Tensor):
         pos_mask = labels.unsqueeze(0) == labels.unsqueeze(1)
@@ -1367,16 +1319,6 @@ def _train_epoch(self, train_loader: DataLoader, epoch: int) -> Tuple[float, flo
             logger.error(f"Error saving features to {output_path}: {str(e)}")
             raise
 
-
-
-    def save_features_old(self, features: torch.Tensor, labels: torch.Tensor, output_path: str):
-        """Save extracted features in format compatible with adaptive_dbnn"""
-        feature_dict = {f'feature_{i}': features[:, i].numpy() for i in range(features.shape[1])}
-        feature_dict['target'] = labels.numpy()
-
-        df = pd.DataFrame(feature_dict)
-        df.to_csv(output_path, index=False)
-        logger.info(f"Saved features to {output_path}")
 
     def _save_checkpoint(self, checkpoint_dir: str, is_best: bool = False):
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -2292,42 +2234,65 @@ class CNNTrainer:
         return self.history
 
     def _train_epoch(self, train_loader: DataLoader) -> Tuple[float, float]:
-        """Train one epoch"""
+        """Train one epoch with proper resource management"""
+        import gc
+
         self.feature_extractor.train()
         running_loss = 0.0
         correct = 0
         total = 0
 
-        pbar = tqdm(train_loader, desc=f'Epoch {self.current_epoch + 1}',
-                   unit='batch', leave=False)
+        try:
+            pbar = tqdm(train_loader, desc=f'Epoch {self.current_epoch + 1}',
+                       unit='batch', leave=False)
 
-        for inputs, targets in pbar:
-            inputs, targets = inputs.to(self.device), targets.to(self.device)
+            for batch_idx, (inputs, targets) in enumerate(pbar):
+                try:
+                    # Training step
+                    inputs, targets = inputs.to(self.device), targets.to(self.device)
+                    self.optimizer.zero_grad()
+                    outputs = self.feature_extractor(inputs)
+                    loss = F.cross_entropy(outputs, targets)
+                    loss.backward()
+                    self.optimizer.step()
 
-            self.optimizer.zero_grad()
-            outputs = self.feature_extractor(inputs)
-            loss = F.cross_entropy(outputs, targets)
-            loss.backward()
-            self.optimizer.step()
+                    # Update metrics
+                    running_loss += loss.item()
+                    _, predicted = outputs.max(1)
+                    total += targets.size(0)
+                    correct += predicted.eq(targets).sum().item()
 
-            running_loss += loss.item()
-            _, predicted = outputs.max(1)
-            total += targets.size(0)
-            correct += predicted.eq(targets).sum().item()
+                    # Update progress bar
+                    batch_loss = running_loss / (batch_idx + 1)
+                    batch_acc = 100. * correct / total
+                    pbar.set_postfix({
+                        'loss': f'{batch_loss:.4f}',
+                        'acc': f'{batch_acc:.2f}%'
+                    })
 
-            # Update progress bar
-            batch_loss = running_loss / (pbar.n + 1)
-            batch_acc = 100. * correct / total
-            pbar.set_postfix({
-                'loss': f'{batch_loss:.4f}',
-                'acc': f'{batch_acc:.2f}%'
-            })
+                    # Cleanup current batch
+                    del inputs
+                    del outputs
+                    del loss
 
-        pbar.close()
-        epoch_loss = running_loss / len(train_loader)
-        epoch_acc = 100. * correct / total
+                    # Periodic cleanup
+                    if batch_idx % 50 == 0:
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
 
-        return epoch_loss, epoch_acc
+                except Exception as e:
+                    logger.error(f"Error in batch {batch_idx}: {str(e)}")
+                    raise
+
+            pbar.close()
+            return running_loss / len(train_loader), 100. * correct / total
+
+        finally:
+            # Final cleanup
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def _validate(self, val_loader: DataLoader) -> Tuple[float, float]:
         """Validate the model"""
@@ -2362,30 +2327,101 @@ class CNNTrainer:
         return running_loss / len(val_loader), 100. * correct / total
 
     def extract_features(self, loader: DataLoader) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Extract features from data loader"""
+        """Extract features with proper resource management"""
+        import gc
+
         self.feature_extractor.eval()
         features = []
         labels = []
 
-        with torch.no_grad():
-            pbar = tqdm(loader, desc="Extracting features", unit="batch")
-            for inputs, targets in pbar:
-                inputs = inputs.to(self.device)
-                outputs = self.feature_extractor(inputs)
-                features.append(outputs.cpu())
-                labels.append(targets)
+        try:
+            with torch.no_grad():
+                for batch_idx, (inputs, targets) in enumerate(tqdm(loader, desc="Extracting features")):
+                    try:
+                        # Move to device and extract features
+                        inputs = inputs.to(self.device)
+                        outputs = self.feature_extractor(inputs)
 
-        return torch.cat(features), torch.cat(labels)
+                        # Move to CPU and store
+                        features.append(outputs.cpu())
+                        labels.append(targets)
+
+                        # Cleanup current batch
+                        del inputs
+                        del outputs
+
+                        # Periodic cleanup
+                        if batch_idx % 50 == 0:
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+
+                    except Exception as e:
+                        logger.error(f"Error in batch {batch_idx}: {str(e)}")
+                        raise
+
+                # Concatenate results
+                return torch.cat(features), torch.cat(labels)
+
+        except Exception as e:
+            logger.error(f"Error in feature extraction: {str(e)}")
+            raise
+
+        finally:
+            # Final cleanup
+            del features
+            del labels
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def save_features(self, features: torch.Tensor, labels: torch.Tensor, output_path: str):
-        """Save extracted features to CSV"""
-        feature_dict = {f'feature_{i}': features[:, i].numpy() for i in range(features.shape[1])}
-        feature_dict['target'] = labels.numpy()
+        """Save features with proper resource management"""
+        import gc
 
-        df = pd.DataFrame(feature_dict)
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        df.to_csv(output_path, index=False)
-        logger.info(f"Saved features to {output_path}")
+        try:
+            # Create output directory if needed
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+            # Process in chunks to manage memory
+            chunk_size = 1000
+            total_samples = features.shape[0]
+
+            for start_idx in range(0, total_samples, chunk_size):
+                # Get chunk indices
+                end_idx = min(start_idx + chunk_size, total_samples)
+
+                # Create chunk dictionary
+                feature_dict = {
+                    f'feature_{i}': features[start_idx:end_idx, i].numpy()
+                    for i in range(features.shape[1])
+                }
+                feature_dict['target'] = labels[start_idx:end_idx].numpy()
+
+                # Save chunk
+                df = pd.DataFrame(feature_dict)
+                mode = 'w' if start_idx == 0 else 'a'
+                header = start_idx == 0
+
+                with open(output_path, mode, newline='') as f:
+                    df.to_csv(f, index=False, header=header)
+
+                # Cleanup chunk data
+                del feature_dict
+                del df
+                gc.collect()
+
+            logger.info(f"Features saved to {output_path}")
+
+        except Exception as e:
+            logger.error(f"Error saving features: {str(e)}")
+            raise
+
+        finally:
+            # Final cleanup
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def _save_checkpoint(self, is_best: bool = False):
         """Save model checkpoint"""
@@ -2583,475 +2619,6 @@ class CNNTrainer:
         trainer._load_from_checkpoint()
 
         return trainer
-class old_CNNTrainer:
-    def __init__(self, config: Dict, device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
-        self.config = config
-        self.device = device
-        self.feature_dims = config['model']['feature_dims']
-        self.learning_rate = config['model']['learning_rate']
-        self.progress = TrainingProgress()
-
-        # Initialize model and check for previous checkpoint
-        self.feature_extractor = self._initialize_model()
-
-        # Configure optimizer after model initialization
-        optimizer_config = config['model']['optimizer']
-        optimizer_params = {
-            'lr': self.learning_rate,
-            'weight_decay': optimizer_config.get('weight_decay', 0)
-        }
-        if optimizer_config['type'] == 'SGD' and 'momentum' in optimizer_config:
-            optimizer_params['momentum'] = optimizer_config['momentum']
-
-        optimizer_class = getattr(optim, optimizer_config['type'])
-        self.optimizer = optimizer_class(self.feature_extractor.parameters(), **optimizer_params)
-
-        # Training metrics
-        self.best_accuracy = 0.0
-        self.best_loss = float('inf')
-        self.current_epoch = 0
-        self.history = defaultdict(list)
-        self.training_log = []
-        self.training_start_time = None
-
-        # Setup logging directory
-        self.log_dir = os.path.join('Traininglog', config['dataset']['name'])
-        os.makedirs(self.log_dir, exist_ok=True)
-
-
-    def save_features(self, features: torch.Tensor, labels: torch.Tensor, output_path: str):
-        """Save extracted features to CSV"""
-        feature_dict = {f'feature_{i}': features[:, i].numpy() for i in range(features.shape[1])}
-        feature_dict['target'] = labels.numpy()
-
-        df = pd.DataFrame(feature_dict)
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        df.to_csv(output_path, index=False)
-        logger.info(f"Saved features to {output_path}")
-
-    def save_merged_features(self, features: torch.Tensor, labels: torch.Tensor,
-                           dataset_name: str, output_dir: str) -> str:
-        """Save features for merged dataset without train/test suffixes"""
-        os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir, f"{dataset_name}.csv")
-        self.save_features(features, labels, output_path)
-        return output_path
-
-
-    def _load_checkpoint(self, checkpoint_path: str, model: nn.Module) -> bool:
-        """Load model and training state from checkpoint
-
-        Args:
-            checkpoint_path (str): Path to checkpoint file
-            model (nn.Module): Model to load state into
-
-        Returns:
-            bool: True if checkpoint loaded successfully
-        """
-        try:
-            checkpoint = torch.load(checkpoint_path, map_location=self.device)
-            logger.info("Checkpoint loaded successfully")
-
-            # Handle different checkpoint formats
-            if isinstance(checkpoint, dict):
-                # Load model state
-                if 'state_dict' in checkpoint:
-                    model.load_state_dict(checkpoint['state_dict'])
-                elif 'model_state_dict' in checkpoint:
-                    model.load_state_dict(checkpoint['model_state_dict'])
-                else:
-                    logger.warning("No model state dict found in checkpoint")
-                    return False
-
-                # Initialize optimizer first (needed before loading state)
-                if not hasattr(self, 'optimizer'):
-                    self.optimizer = self._initialize_optimizer(self.config)
-
-                # Load training state if available
-                self.current_epoch = checkpoint.get('epoch', 0)
-                self.best_accuracy = checkpoint.get('best_accuracy', 0.0)
-                self.best_loss = checkpoint.get('best_loss', float('inf'))
-
-                # Load optimizer state if available
-                if 'optimizer_state_dict' in checkpoint:
-                    try:
-                        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                        logger.info("Optimizer state loaded")
-                    except Exception as e:
-                        logger.warning(f"Failed to load optimizer state: {str(e)}")
-                        # Reinitialize optimizer if loading fails
-                        self.optimizer = self._initialize_optimizer(self.config)
-
-                # Load training history if available
-                if 'history' in checkpoint:
-                    self.history = defaultdict(list, checkpoint['history'])
-                    logger.info("Training history loaded")
-
-                return True
-            else:
-                # Treat checkpoint as just the model state dict
-                model.load_state_dict(checkpoint)
-                logger.info("Loaded model state only")
-
-                # Initialize optimizer as it's not in checkpoint
-                self.optimizer = self._initialize_optimizer(self.config)
-                return True
-
-        except Exception as e:
-            logger.error(f"Error loading checkpoint: {str(e)}")
-            # Initialize optimizer as fallback
-            self.optimizer = self._initialize_optimizer(self.config)
-            return False
-
-    def _initialize_optimizer(self, config: Dict) -> torch.optim.Optimizer:
-        """Initialize optimizer based on configuration
-
-        Args:
-            config: Model configuration dictionary
-
-        Returns:
-            torch.optim.Optimizer: Initialized optimizer
-        """
-        # Get optimizer configuration
-        optimizer_config = config['model'].get('optimizer', {
-            'type': 'Adam',
-            'weight_decay': 1e-4,
-            'momentum': 0.9,
-            'beta1': 0.9,
-            'beta2': 0.999,
-            'epsilon': 1e-8
-        })
-
-        # Get optimizer parameters
-        optimizer_params = {
-            'lr': config['model'].get('learning_rate', 0.001),
-            'weight_decay': optimizer_config.get('weight_decay', 1e-4)
-        }
-
-        # Add optimizer-specific parameters
-        optimizer_type = optimizer_config.get('type', 'Adam')
-        if optimizer_type == 'SGD':
-            optimizer_params['momentum'] = optimizer_config.get('momentum', 0.9)
-        elif optimizer_type == 'Adam':
-            optimizer_params['betas'] = (
-                optimizer_config.get('beta1', 0.9),
-                optimizer_config.get('beta2', 0.999)
-            )
-            optimizer_params['eps'] = optimizer_config.get('epsilon', 1e-8)
-
-        # Get optimizer class
-        try:
-            optimizer_class = getattr(optim, optimizer_type)
-        except AttributeError:
-            logger.warning(f"Optimizer {optimizer_type} not found, using Adam")
-            optimizer_class = optim.Adam
-
-        return optimizer_class(self.feature_extractor.parameters(), **optimizer_params)
-
-    def _initialize_model(self) -> nn.Module:
-        """Initialize model, optionally loading from previous checkpoint
-
-        Returns:
-            nn.Module: Initialized model
-        """
-        # Create new model instance
-        model = FeatureExtractorCNN(
-            in_channels=self.config['dataset']['in_channels'],
-            feature_dims=self.feature_dims
-        ).to(self.device)
-
-        # Check if we should use previous model
-        if not self.config['execution_flags'].get('fresh_start', False):
-            checkpoint_path = self._find_latest_checkpoint()
-            if checkpoint_path:
-                logger.info(f"Found previous checkpoint at {checkpoint_path}")
-                if self._load_checkpoint(checkpoint_path, model):
-                    logger.info("Successfully initialized model from previous checkpoint")
-                    return model
-
-        # If no checkpoint or loading failed, initialize optimizer
-        self.optimizer = self._initialize_optimizer(self.config)
-        logger.info("Initialized fresh model")
-        return model
-
-    def _find_latest_checkpoint(self) -> Optional[str]:
-        """Find the latest checkpoint for the current dataset
-        Returns:
-            Optional[str]: Path to latest checkpoint or None if not found
-        """
-        dataset_name = self.config['dataset']['name']
-        checkpoint_dir = os.path.join("Model", "cnn_checkpoints")
-
-        if not os.path.exists(checkpoint_dir):
-            logger.info(f"No checkpoint directory found at {checkpoint_dir}")
-            return None
-
-        # Look for both best and latest checkpoints
-        checkpoints = []
-
-        # Check for best model first
-        best_model_path = os.path.join(checkpoint_dir, f"{dataset_name}_best.pth")
-        if os.path.exists(best_model_path):
-            checkpoints.append(best_model_path)
-
-        # Then check for checkpoint
-        checkpoint_path = os.path.join(checkpoint_dir, f"{dataset_name}_checkpoint.pth")
-        if os.path.exists(checkpoint_path):
-            checkpoints.append(checkpoint_path)
-
-        # Finally, look for any other checkpoints matching the dataset name
-        pattern = os.path.join(checkpoint_dir, f"{dataset_name}*.pth")
-        checkpoints.extend(glob.glob(pattern))
-
-        if not checkpoints:
-            logger.info(f"No checkpoints found for {dataset_name}")
-            return None
-
-        # Sort checkpoints by modification time and get the latest
-        latest_checkpoint = max(checkpoints, key=os.path.getmtime)
-        logger.info(f"Latest checkpoint: {latest_checkpoint}")
-        return latest_checkpoint
-
-
-    def _save_checkpoint(self, is_best: bool = False) -> None:
-        """Save model checkpoint"""
-        dataset_name = self.config['dataset']['name']
-        checkpoint_dir = os.path.join("Model", "cnn_checkpoints", dataset_name)
-        os.makedirs(checkpoint_dir, exist_ok=True)
-
-        # Prepare checkpoint data
-        checkpoint = {
-            'epoch': self.current_epoch,
-            'state_dict': self.feature_extractor.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'best_accuracy': self.best_accuracy,
-            'best_loss': self.best_loss,
-            'history': dict(self.history),
-            'config': self.config
-        }
-
-        # Save checkpoint
-        filename = f"{dataset_name}_{'best' if is_best else 'latest'}.pth"
-        checkpoint_path = os.path.join(checkpoint_dir, filename)
-        torch.save(checkpoint, checkpoint_path)
-
-        # Save timestamp file for tracking
-        timestamp_path = os.path.join(checkpoint_dir, f"{filename}.time")
-        with open(timestamp_path, 'w') as f:
-            f.write(str(time.time()))
-
-        logger.info(f"Saved {'best' if is_best else 'latest'} checkpoint to {checkpoint_path}")
-
-    def train(self, train_loader: DataLoader, val_loader: Optional[DataLoader] = None) -> Dict[str, List[float]]:
-        """Train the model with checkpoint handling"""
-        target_accuracy = self.config['training'].get('target_accuracy', 0.95)
-        min_loss = self.config['training'].get('min_loss', 0.01)
-        max_epochs = self.config['training'].get('epochs', 100)
-        patience = self.config['training'].get('early_stopping', {}).get('patience', 5)
-
-        patience_counter = 0
-        best_val_metric = float('inf')
-
-        logger.info(f"Starting training from epoch {self.current_epoch + 1}")
-        logger.info(f"Target accuracy: {target_accuracy}, min loss: {min_loss}")
-
-        # Initialize training timer
-        self.training_start_time = time.time()
-
-        try:
-            for epoch in range(self.current_epoch, max_epochs):
-                self.current_epoch = epoch
-
-                # Training and validation steps...
-                train_loss, train_acc = self._train_epoch(train_loader, epoch)
-
-                if val_loader:
-                    val_loss, val_acc = self._validate(val_loader)
-                    current_metric = val_loss
-                else:
-                    val_loss, val_acc = None, None
-                    current_metric = train_loss
-
-                # Update progress and save checkpoints
-                self.log_training_metrics(epoch, train_loss, train_acc, val_loss, val_acc)
-
-                # Save regular checkpoint
-                self._save_checkpoint(is_best=False)
-
-                # Save best checkpoint if improved
-                if current_metric < best_val_metric:
-                    best_val_metric = current_metric
-                    patience_counter = 0
-                    self._save_checkpoint(is_best=True)
-                else:
-                    patience_counter += 1
-
-                # Check stopping conditions...
-                if train_acc >= target_accuracy and train_loss <= min_loss:
-                    logger.info(f"Reached targets: Accuracy {train_acc:.2f}% >= {target_accuracy}%, "
-                              f"Loss {train_loss:.4f} <= {min_loss}")
-                    break
-
-                if patience_counter >= patience:
-                    logger.info(f"Early stopping triggered after {epoch + 1} epochs")
-                    break
-
-        except KeyboardInterrupt:
-            logger.info("Training interrupted by user")
-            self._save_checkpoint(is_best=False)  # Save checkpoint on interruption
-
-        return self.history
-
-    def _train_epoch(self, train_loader: DataLoader, epoch: int) -> Tuple[float, float]:
-        """Train one epoch with progress bar"""
-        self.feature_extractor.train()
-        running_loss = 0.0
-        correct = 0
-        total = 0
-
-        # Create progress bar for batches
-        batch_pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}',
-                         unit='batch', position=1, leave=False)
-
-        for batch_idx, (inputs, targets) in enumerate(batch_pbar):
-            inputs, targets = inputs.to(self.device), targets.to(self.device)
-
-            self.optimizer.zero_grad()
-            outputs = self.feature_extractor(inputs)
-            loss = F.cross_entropy(outputs, targets)
-            loss.backward()
-            self.optimizer.step()
-
-            running_loss += loss.item()
-            _, predicted = outputs.max(1)
-            total += targets.size(0)
-            correct += predicted.eq(targets).sum().item()
-
-            # Update batch progress bar
-            batch_loss = running_loss / (batch_idx + 1)
-            batch_acc = 100. * correct / total
-            batch_pbar.set_description(
-                f'Epoch {epoch+1} | Loss: {batch_loss:.4f}, Acc: {batch_acc:.2f}%'
-            )
-
-        batch_pbar.close()
-        epoch_loss = running_loss / len(train_loader)
-        epoch_acc = 100. * correct / total
-
-        return epoch_loss, epoch_acc
-
-    def _validate(self, val_loader: DataLoader) -> Tuple[float, float]:
-        """Validate the model with progress bar"""
-        self.feature_extractor.eval()
-        running_loss = 0.0
-        correct = 0
-        total = 0
-
-        val_pbar = tqdm(val_loader, desc='Validation',
-                       unit='batch', position=1, leave=False)
-
-        with torch.no_grad():
-            for inputs, targets in val_pbar:
-                inputs, targets = inputs.to(self.device), targets.to(self.device)
-                outputs = self.feature_extractor(inputs)
-                loss = F.cross_entropy(outputs, targets)
-
-                running_loss += loss.item()
-                _, predicted = outputs.max(1)
-                total += targets.size(0)
-                correct += predicted.eq(targets).sum().item()
-
-                # Update validation progress bar
-                val_loss = running_loss / (total / targets.size(0))
-                val_acc = 100. * correct / total
-                val_pbar.set_description(
-                    f'Validation | Loss: {val_loss:.4f}, Acc: {val_acc:.2f}%'
-                )
-
-        val_pbar.close()
-        return running_loss / len(val_loader), 100. * correct / total
-
-    def log_training_metrics(self, epoch: int, train_loss: float, train_acc: float,
-                         test_loss: Optional[float] = None, test_acc: Optional[float] = None,
-                         train_loader: DataLoader = None, test_loader: Optional[DataLoader] = None):
-        """Log training metrics and save to file"""
-        if self.training_start_time is None:
-            self.training_start_time = time.time()
-
-        elapsed_time = time.time() - self.training_start_time
-
-        metrics = {
-            'epoch': epoch,
-            'elapsed_time': elapsed_time,
-            'elapsed_time_formatted': str(timedelta(seconds=int(elapsed_time))),
-            'learning_rate': self.optimizer.param_groups[0]['lr'],
-            'train_loss': train_loss,
-            'train_accuracy': train_acc,
-            'test_loss': test_loss,
-            'test_accuracy': test_acc
-        }
-
-        self.training_log.append(metrics)
-
-        # Save to CSV
-        log_df = pd.DataFrame(self.training_log)
-        log_path = os.path.join(self.log_dir, 'training_metrics.csv')
-        log_df.to_csv(log_path, index=False)
-
-        # Log to console
-        log_message = (f"Epoch {epoch}: Train Loss: {train_loss:.4f}, "
-                      f"Train Acc: {train_acc:.2f}%")
-        if test_loss is not None:
-            log_message += f", Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.2f}%"
-
-        logger.info(log_message)
-
-    def extract_features(self, loader: DataLoader) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Extract features from data loader with progress"""
-        self.feature_extractor.eval()
-        features = []
-        labels = []
-
-        with torch.no_grad():
-            pbar = tqdm(loader, desc="Extracting features", unit="batch")
-            for inputs, targets in pbar:
-                inputs = inputs.to(self.device)
-                outputs = self.feature_extractor(inputs)
-                features.append(outputs.cpu())
-                labels.append(targets)
-                pbar.update(1)
-            pbar.close()
-
-        return torch.cat(features), torch.cat(labels)
-
-    def save_features(self, features: torch.Tensor, labels: torch.Tensor, output_path: str):
-        """Save extracted features to CSV"""
-        feature_dict = {f'feature_{i}': features[:, i].numpy() for i in range(features.shape[1])}
-        feature_dict['target'] = labels.numpy()
-
-        df = pd.DataFrame(feature_dict)
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        df.to_csv(output_path, index=False)
-        logger.info(f"Saved features to {output_path}")
-
-    def _save_checkpoint(self, is_best: bool = False):
-        """Save model checkpoint"""
-        checkpoint_dir = os.path.join('Model', 'cnn_checkpoints')
-        os.makedirs(checkpoint_dir, exist_ok=True)
-
-        checkpoint = {
-            'state_dict': self.feature_extractor.state_dict(),
-            'optimizer': self.optimizer.state_dict(),
-            'epoch': self.current_epoch,
-            'best_accuracy': self.best_accuracy,
-            'history': dict(self.history),
-            'config': self.config
-        }
-
-        filename = f"{self.config['dataset']['name']}_{'best' if is_best else 'checkpoint'}.pth"
-        path = os.path.join(checkpoint_dir, filename)
-        torch.save(checkpoint, path)
-        logger.info(f"Saved checkpoint to {path}")
 
 def print_usage():
     """Print usage information with examples"""
