@@ -3132,12 +3132,16 @@ class DBNN(GPUDBNN):
             plt.close()
         except Exception as e:
             print(f"Warning: Could not save confusion matrix plot: {str(e)}")
+
     def train(self, X_train: torch.Tensor, y_train: torch.Tensor, X_test: torch.Tensor, y_test: torch.Tensor, batch_size: int = 32):
-        """Training loop with progress bars and proper metric calculation timing"""
+        """Training loop with proper weight handling and enhanced progress tracking"""
         print("\nStarting training...")
 
         # Initialize progress bar for epochs
         epoch_pbar = tqdm(total=self.max_epochs, desc="Training epochs")
+
+        # Store current weights for prediction during training
+        train_weights = self.current_W.clone() if self.current_W is not None else None
 
         # Pre-allocate tensors for batch processing
         n_samples = len(X_train)
@@ -3151,8 +3155,11 @@ class DBNN(GPUDBNN):
         train_accuracies = []
         test_accuracies = []
         prev_train_error = float('inf')
+        prev_train_accuracy = 0.0
         prev_test_accuracy = 0.0
         patience_counter = 0
+        best_train_accuracy = 0.0
+        best_test_accuracy = 0.0
 
         if self.in_adaptive_fit:
             patience = 5
@@ -3205,45 +3212,70 @@ class DBNN(GPUDBNN):
             train_error_rate = n_errors / n_samples
             error_rates.append(train_error_rate)
 
-            # Calculate test accuracy
-            if hasattr(self, 'test_indices') and self.test_indices:
-                full_test_data = self.X_tensor[self.test_indices]
-                full_test_labels = self.y_tensor[self.test_indices]
-                test_predictions = self.predict(full_test_data, batch_size=batch_size)
-                test_accuracy = (test_predictions == full_test_labels.cpu()).float().mean()
-            else:
+            # Calculate metrics using current weights
+            with torch.no_grad():
+                # Temporarily set current_W for training metrics
+                orig_weights = self.current_W
+                self.current_W = train_weights
+
+                # Training metrics
+                train_predictions = self.predict(X_train, batch_size=batch_size)
+                train_accuracy = (train_predictions == y_train.cpu()).float().mean()
+                train_loss = n_errors / n_samples
+
+                # Validation metrics using current weights
                 test_predictions = self.predict(X_test, batch_size=batch_size)
                 test_accuracy = (test_predictions == y_test.cpu()).float().mean()
+                test_loss = (test_predictions != y_test.cpu()).float().mean()
 
-            # Update epoch progress with newly calculated metrics
-            epoch_pbar.update(1)
-            epoch_pbar.set_postfix({
-                'train_error': f"{train_error_rate:.4f}",
-                'test_acc': f"{test_accuracy:.4f}"
-            })
+                # Restore original weights
+                self.current_W = orig_weights
+
+            # Update best accuracies
+            best_train_accuracy = max(best_train_accuracy, train_accuracy)
+            best_test_accuracy = max(best_test_accuracy, test_accuracy)
+
+            # Store metrics
+            train_losses.append(train_loss)
+            test_losses.append(test_loss)
+            train_accuracies.append(train_accuracy)
+            test_accuracies.append(test_accuracy)
 
             # Calculate training time
             Trend_time = time.time()
             training_time = Trend_time - Trstart_time
 
-            print(f"Training time for epoch {epoch + 1} is: {Colors.highlight_time(training_time)} seconds")
-            print(f"Epoch {epoch + 1}: Train error rate = {Colors.color_value(train_error_rate, prev_train_error, False)}, "
-                  f"Test accuracy = {Colors.color_value(test_accuracy, prev_test_accuracy, True)}")
+            # Update progress display
+            epoch_pbar.update(1)
+            epoch_pbar.set_postfix({
+                'train_err': f"{train_error_rate:.4f} (best: {1-best_train_accuracy:.4f})",
+                'train_acc': f"{train_accuracy:.4f} (best: {best_train_accuracy:.4f})",
+                'val_acc': f"{test_accuracy:.4f} (best: {best_test_accuracy:.4f})"
+            })
+
+            print(f"\nEpoch {epoch + 1}/{self.max_epochs}:")
+            print(f"Training time: {Colors.highlight_time(training_time)} seconds")
+            print(f"Train error rate: {Colors.color_value(train_error_rate, prev_train_error, False)} (best: {1-best_train_accuracy:.4f})")
+            print(f"Train accuracy: {Colors.color_value(train_accuracy, prev_train_accuracy, True)} (best: {Colors.GREEN}{best_train_accuracy:.4f}{Colors.ENDC})")
+            print(f"Test accuracy: {Colors.color_value(test_accuracy, prev_test_accuracy, True)} (best: {Colors.GREEN}{best_test_accuracy:.4f}{Colors.ENDC})")
 
             # Update previous values for next iteration
             prev_train_error = train_error_rate
+            prev_train_accuracy = train_accuracy
             prev_test_accuracy = test_accuracy
 
             # Check for convergence
             if test_accuracy == 1.0 or train_error_rate == 0:
-                print(f"Moving on to Epoch: {epoch + 1}")
+                print(f"Achieved perfect accuracy at epoch {epoch + 1}")
                 break
 
+            # Update best model if improved
             if train_error_rate <= self.best_error:
                 improvement = self.best_error - train_error_rate
                 self.best_error = train_error_rate
-                self.best_W = self.current_W.clone()
+                self.best_W = self.current_W.clone()  # Save current weights as best
                 self._save_best_weights()
+
                 if improvement <= 0.001:
                     patience_counter += 1
                 else:
@@ -3252,23 +3284,14 @@ class DBNN(GPUDBNN):
             else:
                 patience_counter += 1
 
+            # Early stopping check
             if patience_counter >= patience:
-                print(f"No significant improvement for {patience} epochs. Early stopping.")
+                print(f"\nNo significant improvement for {patience} epochs. Early stopping.")
                 break
 
+            # Update weights if there were failures
             if failed_cases:
                 self._update_priors_parallel(failed_cases, batch_size)
-
-            # Calculate and store metrics
-            train_loss = n_errors / n_samples
-            train_pred = self.predict(X_train, batch_size)
-            train_acc = (train_pred == y_train.cpu()).float().mean()
-            test_loss = (test_predictions != y_test.cpu()).float().mean()
-
-            train_losses.append(train_loss)
-            test_losses.append(test_loss)
-            train_accuracies.append(train_acc)
-            test_accuracies.append(test_accuracy)
 
             # Plot metrics
             self.plot_training_metrics(
@@ -3277,9 +3300,11 @@ class DBNN(GPUDBNN):
                 save_path=f'{self.dataset_name}_training_metrics.png'
             )
 
+        # Training complete
         epoch_pbar.close()
         self._save_model_components()
         return self.current_W.cpu(), error_rates
+
 
 
     def plot_training_metrics(self, train_loss, test_loss, train_acc, test_acc, save_path=None):
