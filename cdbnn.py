@@ -630,6 +630,7 @@ class DatasetProcessor:
             logger.error(f"Error generating configuration: {str(e)}")
             raise
 
+
     def _process_custom(self):
         """Process custom dataset from directory or compressed file with improved path handling"""
         if os.path.isdir(self.datafile):
@@ -1577,22 +1578,153 @@ class ConfigManager:
             }
         }
 
-    def generate_data_config(self, json_config: dict) -> dict:
-        """Generate data configuration from main config"""
-        return {
-            "dataset": {
-                "name": json_config['dataset']['name'],
-                "type": json_config['dataset']['type'],
-                "input_size": json_config['dataset']['input_size'],
-                "num_classes": json_config['dataset']['num_classes']
-            },
-            "preprocessing": {
-                "normalize": True,
-                "mean": json_config['dataset']['mean'],
-                "std": json_config['dataset']['std']
-            },
-            "augmentation": json_config.get('augmentation', {})
-        }
+    def generate_data_conf(self, output_path: str, data_source: str, dataset_name: str = None) -> None:
+        """
+        Generate .conf file for dataset with proper structure and comments
+
+        Args:
+            output_path: Path to save the .conf file
+            data_source: Path or URL to data file
+            dataset_name: Optional dataset name (defaults to source basename)
+        """
+        import pandas as pd
+        import json
+        import urllib.parse
+
+        try:
+            # Determine if source is URL or file path
+            is_url = bool(urllib.parse.urlparse(data_source).scheme)
+
+            # Get dataset name if not provided
+            if not dataset_name:
+                if is_url:
+                    dataset_name = os.path.splitext(os.path.basename(urllib.parse.urlparse(data_source).path))[0]
+                else:
+                    dataset_name = os.path.splitext(os.path.basename(data_source))[0]
+
+            # Read first few lines to determine separator and headers
+            if is_url:
+                df = pd.read_csv(data_source, nrows=5)
+                separator = ','  # Default for URLs
+                has_header = True  # Assume headers for URLs
+            else:
+                with open(data_source, 'r') as f:
+                    first_line = f.readline().strip()
+                    # Try common separators
+                    for sep in [',', ';', '\t', '|']:
+                        if sep in first_line:
+                            separator = sep
+                            break
+                    else:
+                        separator = ','  # Default to comma
+
+                # Check if has headers by looking at first row vs second row
+                with open(data_source, 'r') as f:
+                    first_line = f.readline().strip()
+                    second_line = f.readline().strip()
+                    first_fields = first_line.split(separator)
+                    second_fields = second_line.split(separator)
+
+                    # Check if first row looks like headers
+                    has_header = all(not field.replace('.','').replace('-','').isdigit()
+                                   for field in first_fields)
+
+                df = pd.read_csv(data_source, sep=separator, header=0 if has_header else None, nrows=5)
+
+            # Get column names
+            if has_header:
+                column_names = df.columns.tolist()
+            else:
+                column_names = [f"column_{i}" for i in range(len(df.columns))]
+
+            # Create configuration dictionary with comments
+            config = {
+                "__comment0": "Dataset configuration file",
+                "file_path": data_source,
+                "__comment1": "Path or URL to data file",
+                "column_names": column_names,
+                "__comment2": "Column names from dataset",
+                "separator": separator,
+                "__comment3": "CSV separator character",
+                "has_header": has_header,
+                "__comment4": "Whether file has header row",
+                "target_column": "target",
+                "__comment5": "Target column name or index",
+
+                "likelihood_config": {
+                    "__comment6": "Likelihood computation settings",
+                    "feature_group_size": 2,
+                    "__comment7": "Size of feature groups (usually 2)",
+                    "max_combinations": min(1000, len(column_names) * (len(column_names) - 1) // 2),
+                    "__comment8": "Maximum feature combinations",
+                    "bin_sizes": [20],
+                    "__comment9": "Bin sizes for histogram"
+                },
+
+                "active_learning": {
+                    "__comment10": "Active learning parameters",
+                    "tolerance": 1.0,
+                    "__comment11": "Learning tolerance",
+                    "cardinality_threshold_percentile": 95,
+                    "__comment12": "Percentile for cardinality threshold",
+                    "strong_margin_threshold": 0.3,
+                    "__comment13": "Threshold for strong failures",
+                    "marginal_margin_threshold": 0.1,
+                    "__comment14": "Threshold for marginal failures",
+                    "min_divergence": 0.1,
+                    "__comment15": "Minimum divergence between samples"
+                },
+
+                "training_params": {
+                    "__comment16": "Training parameters specific to this dataset",
+                    "Save_training_epochs": True,
+                    "__comment17": "Save epoch-specific data",
+                    "training_save_path": f"training_data/{dataset_name}",
+                    "__comment18": "Dataset-specific save path"
+                },
+
+                "modelType": "Histogram",
+                "__comment19": "Model type (Histogram or Gaussian)"
+            }
+
+            # Custom JSON encoder to preserve comments
+            class CommentedJSONEncoder(json.JSONEncoder):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.indentation_level = 0
+
+                def encode(self, obj):
+                    if isinstance(obj, dict):
+                        items = []
+                        self.indentation_level += 4
+                        indent = ' ' * self.indentation_level
+                        for key, value in obj.items():
+                            if key.startswith('__comment'):
+                                # Convert comment to // style
+                                items.append(f'{indent}// {value}')
+                            else:
+                                encoded_value = self.encode(value)
+                                items.append(f'{indent}"{key}": {encoded_value}')
+                        self.indentation_level -= 4
+                        return '{\n' + ',\n'.join(items) + '\n' + ' ' * self.indentation_level + '}'
+                    return json.JSONEncoder.encode(self, obj)
+
+            # Save configuration with proper formatting
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            with open(output_path, 'w') as f:
+                json.dump(config, f, cls=CommentedJSONEncoder, indent=4)
+
+            logger.info(f"Generated configuration file: {output_path}")
+
+        except Exception as e:
+            logger.error(f"Error generating configuration: {str(e)}")
+            raise
+
+        finally:
+            # Cleanup
+            if 'df' in locals():
+                del df
+            gc.collect()
 
     def load_or_generate_config(self) -> dict:
         """Load existing configuration or generate new one"""
@@ -1627,66 +1759,33 @@ class ConfigManager:
 
         return train_dir, test_dir, config
 
-    def generate_dbnn_conf(self, json_config: dict, dataset_name: str) -> dict:
-        """Generate DBNN configuration based on JSON config"""
-        training_params = json_config.get('training', {})
-        model_params = json_config.get('model', {})
+    def ensure_conf_files_exist(self, dataset_name: str, feature_dims: int, json_config: dict) -> None:
+        """
+        Check for existence of conf files and generate them if missing.
 
-        return {
-            "training_params": {
-                "trials": training_params.get('epochs', 100),
-                "cardinality_threshold": 0.9,
-                "cardinality_tolerance": 4,
-                "learning_rate": model_params.get('learning_rate', 0.001),
-                "random_seed": 42,
-                "epochs": training_params.get('epochs', 1000),
-                "test_fraction": training_params.get('validation_split', 0.2),
-                "enable_adaptive": True,
-                "modelType": "Histogram",
-                "compute_device": "cuda" if json_config['execution_flags'].get('use_gpu', True) else "cpu",
-                "use_interactive_kbd": False,
-                "debug_enabled": json_config['execution_flags'].get('debug_mode', True),
-                "Save_training_epochs": True,
-                "training_save_path": f"training_data/{dataset_name}"
-            },
-            "execution_flags": {
-                "train": True,
-                "train_only": False,
-                "predict": True,
-                "gen_samples": False,
-                "fresh_start": json_config['execution_flags'].get('fresh_start', False),
-                "use_previous_model": json_config['execution_flags'].get('use_previous_model', True)
-            }
-        }
+        Args:
+            dataset_name: Name of the dataset
+            feature_dims: Number of feature dimensions
+            json_config: Main JSON configuration
+        """
+        # Check and generate adaptive_dbnn.conf
+        dbnn_conf_path = os.path.join(self.base_dir, "adaptive_dbnn.conf")
+        if not os.path.exists(dbnn_conf_path):
+            logger.info("adaptive_dbnn.conf not found. Generating...")
+            dbnn_config = self.generate_dbnn_config(json_config)
+            with open(dbnn_conf_path, 'w') as f:
+                json.dump(dbnn_config, f, indent=4)
+            logger.info(f"Generated adaptive_dbnn.conf at {dbnn_conf_path}")
 
-    def generate_data_conf(self, json_config: dict, feature_dims: int) -> dict:
-        """Generate data configuration based on JSON config"""
-        dataset_config = json_config.get('dataset', {})
+        # Check and generate dataset-specific .conf
+        dataset_conf_path = os.path.join(self.base_dir, f"{dataset_name}.conf")
+        if not os.path.exists(dataset_conf_path):
+            logger.info(f"{dataset_name}.conf not found. Generating...")
+            data_config = self.generate_data_conf(json_config, feature_dims)
+            with open(dataset_conf_path, 'w') as f:
+                json.dump(data_config, f, indent=4)
+            logger.info(f"Generated {dataset_name}.conf at {dataset_conf_path}")
 
-        return {
-            "file_path": f"{dataset_config.get('name', 'dataset')}.csv",
-            "column_names": [f"feature_{i}" for i in range(feature_dims)] + ["target"],
-            "separator": ",",
-            "has_header": True,
-            "target_column": "target",
-            "likelihood_config": {
-                "feature_group_size": 2,
-                "max_combinations": min(1000, feature_dims * (feature_dims - 1) // 2),
-                "bin_sizes": [20]
-            },
-            "active_learning": {
-                "tolerance": 1.0,
-                "cardinality_threshold_percentile": 95,
-                "strong_margin_threshold": 0.3,
-                "marginal_margin_threshold": 0.1,
-                "min_divergence": 0.1
-            },
-            "training_params": {
-                "Save_training_epochs": True,
-                "training_save_path": f"training_data/{dataset_config.get('name', 'dataset')}"
-            },
-            "modelType": "Histogram"
-        }
 
     def edit_conf_file(self, conf_data: dict, filepath: str) -> dict:
         """Edit configuration file with user input"""
@@ -2770,6 +2869,10 @@ def main():
             output_dir=args.output_dir
         )
 
+        # Initialize config manager
+        config_manager = ConfigManager(args.output_dir)
+
+
         # Process dataset
         logger.info("Processing dataset...")
         train_dir, test_dir = processor.process()
@@ -2794,6 +2897,12 @@ def main():
             config['execution_flags']['use_gpu'] = False
         if args.debug:
             config['execution_flags']['debug_mode'] = True
+
+        # Ensure all necessary conf files exist
+        dataset_name = config['dataset']['name']
+        feature_dims = config['model']['feature_dims']
+        config_manager.ensure_conf_files_exist(dataset_name, feature_dims, config)
+
 
         # Initialize trainer
         logger.info("Initializing CNN trainer...")
