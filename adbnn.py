@@ -458,7 +458,7 @@ def _filter_features_from_config(df: pd.DataFrame, config: Dict) -> pd.DataFrame
 
     # Get current DataFrame columns
     current_cols = df.columns.tolist()
-    print(f"Current DataFrame columns: {current_cols}")
+    #print(f"Current DataFrame columns: {current_cols}")
 
     # Get column names from config (only those not commented out)
     requested_columns = [
@@ -480,7 +480,7 @@ def _filter_features_from_config(df: pd.DataFrame, config: Dict) -> pd.DataFrame
         return df
 
     # Return DataFrame with only the columns to keep
-    print(f"Keeping only these features: {valid_columns}")
+    #print(f"Keeping only these features: {valid_columns}")
     return df[valid_columns]
 #-------------------------------------------------
 class ComputationCache:
