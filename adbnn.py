@@ -314,7 +314,7 @@ class DatasetConfig:
                 try:
                     df = pd.read_csv(validated_config['file_path'], nrows=0)
                     validated_config['column_names'] = df.columns.tolist()
-                    print(f"Inferred column names from CSV: {validated_config['column_names']}")
+                    #print(f"Inferred column names from CSV: {validated_config['column_names']}")
                 except Exception as e:
                     print(f"Warning: Could not infer column names: {str(e)}")
                     return None
