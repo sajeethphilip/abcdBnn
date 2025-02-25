@@ -1891,7 +1891,7 @@ class DBNN(GPUDBNN):
             y = self.data[self.target_column]
             print(f" Initial data shape: X={X.shape}, y={len(y)}")
             print(f"Number of classes in data = {np.unique(y)}")
-
+            print(self.data.head)
             # Initialize label encoder if not already done
             if not hasattr(self.label_encoder, 'classes_'):
                 self.label_encoder.fit(y)
