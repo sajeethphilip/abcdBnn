@@ -442,52 +442,46 @@ class DatasetConfig:
 #---------------------------------------Feature Filter with a #------------------------------------
 def _filter_features_from_config(df: pd.DataFrame, config: Dict) -> pd.DataFrame:
     """
-    Filter DataFrame columns based on commented features in config
+    Filter DataFrame to only include specified columns from config
 
     Args:
         df: Input DataFrame
         config: Configuration dictionary containing column names
 
     Returns:
-        DataFrame with filtered columns
+        DataFrame with only the specified columns
     """
     # If no column names in config, return original DataFrame
-    if 'column_names' not in config:
+    if 'column_names' not in config or not config['column_names']:
+        print("No column names specified in config. Keeping all columns.")
         return df
-
-    # Get column names from config
-    column_names = config['column_names']
-
-    # Create mapping of position to column name
-    col_mapping = {i: name.strip() for i, name in enumerate(column_names)}
-
-    # Identify commented features (starting with #)
-    commented_features = {
-        i: name.lstrip('#').strip()
-        for i, name in col_mapping.items()
-        if name.startswith('#')
-    }
 
     # Get current DataFrame columns
     current_cols = df.columns.tolist()
+    print(f"Current DataFrame columns: {current_cols}")
 
-    # Columns to drop (either by name or position)
-    cols_to_drop = []
+    # Get column names from config (only those not commented out)
+    requested_columns = [
+        name.strip() for name in config['column_names']
+        if not name.strip().startswith('#')
+    ]
 
-    for pos, name in commented_features.items():
-        # Try to drop by name first
-        if name in current_cols:
-            cols_to_drop.append(name)
-        # If name not found, try position
-        elif pos < len(current_cols):
-            cols_to_drop.append(current_cols[pos])
+    # If no uncommented columns found in config, return original DataFrame
+    if not requested_columns:
+        print("No uncommented column names found in config. Returning original DataFrame.")
+        return df
 
-    # Drop identified columns
-    if cols_to_drop:
-        df = df.drop(columns=cols_to_drop)
-        print(f"Dropped commented features: {cols_to_drop}")
+    # Check if any requested columns exist in the DataFrame
+    valid_columns = [col for col in requested_columns if col in current_cols]
 
-    return df
+    # If no valid columns found, return original DataFrame
+    if not valid_columns:
+        print("None of the requested columns exist in the DataFrame. Returning original DataFrame.")
+        return df
+
+    # Return DataFrame with only the columns to keep
+    print(f"Keeping only these features: {valid_columns}")
+    return df[valid_columns]
 #-------------------------------------------------
 class ComputationCache:
     """Cache for frequently used computations"""
@@ -1893,8 +1887,11 @@ class DBNN(GPUDBNN):
 
         try:
             # Get initial data
-            X = self.data.drop(columns=[self.target_column])
+            column_names = get.config('column_names')
+            X = self.data[column_names]
+            X = X.drop(columns=[self.target_column])
             y = self.data[self.target_column]
+
             DEBUG.log(f" Initial data shape: X={X.shape}, y={len(y)}")
 
             # Initialize label encoder if not already done
