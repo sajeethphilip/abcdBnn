@@ -1888,6 +1888,7 @@ class DBNN(GPUDBNN):
         try:
             # Get initial data
             X = self.data.drop(columns=[self.target_column])
+            print(X)
             y = self.data[self.target_column]
             DEBUG.log(f" Initial data shape: X={X.shape}, y={len(y)}")
 
