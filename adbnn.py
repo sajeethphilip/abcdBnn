@@ -1888,6 +1888,7 @@ class DBNN(GPUDBNN):
         try:
             # Get initial data
             column_names = self.config.get('column_names')
+            print(f"The column names looked for are: {column_names}")
             X = self.data[column_names]
             X = X.drop(columns=[self.target_column])
             y = self.data[self.target_column]
