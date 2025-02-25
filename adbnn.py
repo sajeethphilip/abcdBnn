@@ -1889,6 +1889,7 @@ class DBNN(GPUDBNN):
             # Get initial data
             X = self.data.drop(columns=[self.target_column])
             y = self.data[self.target_column]
+            print(self.target_column)
             print(f" Initial data shape: X={X.shape}, y={len(y)}")
             print(f"Number of classes in data = {np.unique(y)}")
             print(self.data.head)
