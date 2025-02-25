@@ -1888,9 +1888,8 @@ class DBNN(GPUDBNN):
         try:
             # Get initial data
             X = self.data.drop(columns=[self.target_column])
-            print(X)
             y = self.data[self.target_column]
-            DEBUG.log(f" Initial data shape: X={X.shape}, y={len(y)}")
+            print(f" Initial data shape: X={X.shape}, y={len(y)}")
 
             # Initialize label encoder if not already done
             if not hasattr(self.label_encoder, 'classes_'):
